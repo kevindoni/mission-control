@@ -1640,6 +1640,37 @@ const migrations: Migration[] = [
         )
       `);
     }
+  },
+  {
+    id: '031',
+    name: 'add_codex_sessions',
+    up: (db) => {
+      console.log('[Migration 031] Adding codex_sessions table...');
+
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS codex_sessions (
+          id TEXT PRIMARY KEY,
+          agent_id TEXT REFERENCES agents(id),
+          task_id TEXT REFERENCES tasks(id) ON DELETE CASCADE,
+          codex_thread_id TEXT,
+          pid INTEGER,
+          status TEXT NOT NULL DEFAULT 'running' CHECK (status IN ('running', 'completed', 'failed', 'cancelled')),
+          command TEXT NOT NULL,
+          cwd TEXT NOT NULL,
+          log_path TEXT,
+          exit_code INTEGER,
+          signal TEXT,
+          error TEXT,
+          started_at TEXT DEFAULT (datetime('now')),
+          ended_at TEXT,
+          created_at TEXT DEFAULT (datetime('now')),
+          updated_at TEXT DEFAULT (datetime('now'))
+        )
+      `);
+
+      db.exec('CREATE INDEX IF NOT EXISTS idx_codex_sessions_task ON codex_sessions(task_id, status)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_codex_sessions_agent ON codex_sessions(agent_id, status)');
+    }
   }
 ];
 

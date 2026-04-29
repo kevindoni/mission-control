@@ -8,10 +8,34 @@ import { hasStageEvidence, canUseBoardOverride, auditBoardOverride, taskCanBeDon
 import { updateConvoyProgress, checkConvoyCompletion } from '@/lib/convoy';
 import { syncGatewayAgentsToCatalog } from '@/lib/agent-catalog-sync';
 import { triggerWorkspaceMerge } from '@/lib/workspace-isolation';
+import { cancelCodexRunsForTask } from '@/lib/codex/dispatch';
 import { UpdateTaskSchema } from '@/lib/validation';
 import type { Task, UpdateTaskRequest, Agent, TaskDeliverable } from '@/lib/types';
 
 export const dynamic = 'force-dynamic';
+
+function clearTaskReferences(taskId: string): void {
+  cancelCodexRunsForTask(taskId);
+  run('DELETE FROM task_roles WHERE task_id = ?', [taskId]);
+  run('DELETE FROM work_checkpoints WHERE task_id = ?', [taskId]);
+  run('DELETE FROM workspace_ports WHERE task_id = ?', [taskId]);
+  run('DELETE FROM workspace_merges WHERE task_id = ?', [taskId]);
+  run('DELETE FROM planning_questions WHERE task_id = ?', [taskId]);
+  run('DELETE FROM planning_specs WHERE task_id = ?', [taskId]);
+  run('DELETE FROM task_notes WHERE task_id = ?', [taskId]);
+  run('DELETE FROM user_task_reads WHERE task_id = ?', [taskId]);
+  run('DELETE FROM task_activities WHERE task_id = ?', [taskId]);
+  run('DELETE FROM task_deliverables WHERE task_id = ?', [taskId]);
+  run('DELETE FROM openclaw_sessions WHERE task_id = ?', [taskId]);
+  run('DELETE FROM codex_sessions WHERE task_id = ?', [taskId]);
+  run('DELETE FROM events WHERE task_id = ?', [taskId]);
+  run('DELETE FROM skill_reports WHERE task_id = ?', [taskId]);
+  run('UPDATE agent_health SET task_id = NULL WHERE task_id = ?', [taskId]);
+  run('UPDATE cost_events SET task_id = NULL WHERE task_id = ?', [taskId]);
+  run('UPDATE conversations SET task_id = NULL WHERE task_id = ?', [taskId]);
+  run('UPDATE knowledge_entries SET task_id = NULL WHERE task_id = ?', [taskId]);
+  run('UPDATE product_skills SET created_by_task_id = NULL WHERE created_by_task_id = ?', [taskId]);
+}
 
 // GET /api/tasks/[id] - Get a single task
 export async function GET(
@@ -511,9 +535,7 @@ export async function DELETE(
       // Delete sub-tasks first (CASCADE handles convoy_subtasks)
       const subtaskIds = queryAll<{ task_id: string }>('SELECT task_id FROM convoy_subtasks WHERE convoy_id = ?', [convoy.id]);
       for (const { task_id } of subtaskIds) {
-        run('DELETE FROM work_checkpoints WHERE task_id = ?', [task_id]);
-        run('DELETE FROM openclaw_sessions WHERE task_id = ?', [task_id]);
-        run('DELETE FROM events WHERE task_id = ?', [task_id]);
+        clearTaskReferences(task_id);
         run('DELETE FROM tasks WHERE id = ?', [task_id]);
       }
       run('DELETE FROM agent_mailbox WHERE convoy_id = ?', [convoy.id]);
@@ -521,13 +543,7 @@ export async function DELETE(
     }
 
     // Delete or nullify related records first (foreign key constraints)
-    // Note: task_activities and task_deliverables have ON DELETE CASCADE
-    run('DELETE FROM work_checkpoints WHERE task_id = ?', [id]);
-    run('DELETE FROM openclaw_sessions WHERE task_id = ?', [id]);
-    run('DELETE FROM events WHERE task_id = ?', [id]);
-    // Conversations and Knowledge reference tasks - nullify or delete
-    run('UPDATE conversations SET task_id = NULL WHERE task_id = ?', [id]);
-    run('UPDATE knowledge_entries SET task_id = NULL WHERE task_id = ?', [id]);
+    clearTaskReferences(id);
 
     // Now delete the task (cascades to task_activities and task_deliverables)
     run('DELETE FROM tasks WHERE id = ?', [id]);

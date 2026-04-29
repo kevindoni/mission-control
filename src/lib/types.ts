@@ -235,6 +235,25 @@ export interface OpenClawSession {
   updated_at: string;
 }
 
+export interface CodexSession {
+  id: string;
+  agent_id: string;
+  task_id: string;
+  codex_thread_id?: string;
+  pid?: number;
+  status: 'running' | 'completed' | 'failed' | 'cancelled';
+  command: string;
+  cwd: string;
+  log_path?: string;
+  exit_code?: number;
+  signal?: string;
+  error?: string;
+  started_at: string;
+  ended_at?: string;
+  created_at: string;
+  updated_at: string;
+}
+
 export type ActivityType = 'spawned' | 'updated' | 'completed' | 'file_created' | 'status_changed';
 
 export type SemanticAgentHealthState =

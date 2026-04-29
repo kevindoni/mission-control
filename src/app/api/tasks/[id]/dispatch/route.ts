@@ -12,6 +12,9 @@ import { buildCheckpointContext } from '@/lib/checkpoint';
 import { formatMailForDispatch } from '@/lib/mailbox';
 import { getPendingNotesForDispatch } from '@/lib/task-notes';
 import { createTaskWorkspace, determineIsolationStrategy } from '@/lib/workspace-isolation';
+import { getAgentRuntimeSettings } from '@/lib/runtime-settings';
+import { getCodexCliStatus } from '@/lib/codex/status';
+import { cancelCodexRunsForTask, startCodexTaskRun } from '@/lib/codex/dispatch';
 import type { Task, Agent, Product, OpenClawSession, WorkflowStage, TaskImage } from '@/lib/types';
 
 export const dynamic = 'force-dynamic';
@@ -41,8 +44,8 @@ function dispatchErrorResponse(taskId: string, error: string, status: number) {
 /**
  * POST /api/tasks/[id]/dispatch
  * 
- * Dispatches a task to its assigned agent's OpenClaw session.
- * Creates session if needed, sends task details to agent.
+ * Dispatches a task to its assigned agent through the configured runtime.
+ * OpenClaw keeps the existing chat-session flow; Codex starts a tracked CLI run.
  */
 export async function POST(request: NextRequest, { params }: RouteParams) {
   try {
@@ -126,65 +129,7 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       }
     }
 
-    // Connect to OpenClaw Gateway
-    const client = getOpenClawClient();
-    if (!client.isConnected()) {
-      try {
-        await client.connect();
-      } catch (err) {
-        console.error('Failed to connect to OpenClaw Gateway:', err);
-        client.forceReconnect();
-        return dispatchErrorResponse(id, 'Failed to connect to OpenClaw Gateway', 503);
-      }
-    }
-
-    // Get or create OpenClaw session for this agent + task combination
-    let session = queryOne<OpenClawSession>(
-      'SELECT * FROM openclaw_sessions WHERE agent_id = ? AND task_id = ? AND status = ?',
-      [agent.id, id, 'active']
-    );
-    const reusedExistingSession = Boolean(session);
-
     const now = new Date().toISOString();
-
-    if (!session) {
-      // Create session record
-      const sessionId = uuidv4();
-      const openclawSessionId = `mission-control-${agent.name.toLowerCase().replace(/\s+/g, '-')}-${id}`;
-      
-      run(
-        `INSERT INTO openclaw_sessions (id, agent_id, openclaw_session_id, task_id, channel, status, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        [sessionId, agent.id, openclawSessionId, id, 'mission-control', 'active', now, now]
-      );
-
-      session = queryOne<OpenClawSession>(
-        'SELECT * FROM openclaw_sessions WHERE id = ?',
-        [sessionId]
-      );
-
-      // Log session creation
-      run(
-        `INSERT INTO events (id, type, agent_id, message, created_at)
-         VALUES (?, ?, ?, ?, ?)`,
-        [uuidv4(), 'agent_status_changed', agent.id, `${agent.name} session created`, now]
-      );
-    }
-
-    if (!session) {
-      return dispatchErrorResponse(id, 'Failed to create agent session', 500);
-    }
-
-    console.info('[Dispatch] Agent session resolved for task dispatch', JSON.stringify({
-      taskId: id,
-      taskStatus: task.status,
-      agentId: agent.id,
-      agentName: agent.name,
-      reusedExistingSession,
-      sessionId: session.openclaw_session_id,
-      sessionCreatedAt: session.created_at,
-      sessionUpdatedAt: session.updated_at,
-    }));
 
     // Cost cap warning check
     let costCapWarning: string | undefined;
@@ -457,6 +402,183 @@ If you need help or clarification, ask the orchestrator.`;
     // Inject any pending operator notes (queued via /btw chat)
     const { formatted: pendingNotes } = getPendingNotesForDispatch(id);
     const finalMessage = pendingNotes ? taskMessage + pendingNotes : taskMessage;
+
+    const runtimeSettings = getAgentRuntimeSettings();
+
+    if (runtimeSettings.provider === 'codex') {
+      const codexStatus = await getCodexCliStatus();
+
+      if (!codexStatus.ready) {
+        return dispatchErrorResponse(
+          id,
+          `Codex runtime is not ready: ${codexStatus.error || 'Codex CLI is not authenticated'}`,
+          503
+        );
+      }
+
+      const cancelledRuns = cancelCodexRunsForTask(task.id, agent.id);
+      const codexPrompt = `**CODEX RUNTIME CONTEXT**
+You are running inside Codex CLI for Mission Control.
+Use this Mission Control API base URL exactly as written: ${missionControlUrl}
+Do not replace the hostname with 127.0.0.1 or another loopback spelling.
+When the task requires status, activity, deliverable, or PR updates, call the Mission Control API directly.
+Every Mission Control API curl command must include:
+-H "Authorization: Bearer $MC_API_TOKEN"
+Never print, inspect, or echo MC_API_TOKEN.
+
+${finalMessage}`;
+
+      const codexRun = startCodexTaskRun({
+        task: task as Task,
+        agent,
+        prompt: codexPrompt,
+        workingDirectory: taskProjectDir,
+        env: {
+          CODEX_CLOUD_ENV_ID: runtimeSettings.codexCloudEnvironmentId || undefined,
+          CODEX_DEFAULT_BRANCH: runtimeSettings.codexDefaultBranch || undefined,
+          MISSION_CONTROL_URL: missionControlUrl,
+        },
+      });
+
+      console.info('[Dispatch] Task started through Codex runtime', JSON.stringify({
+        taskId: task.id,
+        agentId: agent.id,
+        agentName: agent.name,
+        sessionId: codexRun.sessionId,
+        pid: codexRun.pid,
+        cwd: codexRun.cwd,
+        cancelledRuns,
+      }));
+
+      if (task.status === 'assigned') {
+        run(
+          'UPDATE tasks SET status = ?, planning_dispatch_error = NULL, status_reason = NULL, updated_at = ? WHERE id = ?',
+          ['in_progress', now, id]
+        );
+      } else {
+        run(
+          'UPDATE tasks SET planning_dispatch_error = NULL, status_reason = NULL, updated_at = ? WHERE id = ?',
+          [now, id]
+        );
+      }
+
+      const updatedTask = queryOne<Task>('SELECT * FROM tasks WHERE id = ?', [id]);
+      if (updatedTask) {
+        broadcast({
+          type: 'task_updated',
+          payload: updatedTask,
+        });
+      }
+
+      run(
+        'UPDATE agents SET status = ?, updated_at = ? WHERE id = ?',
+        ['working', now, agent.id]
+      );
+
+      run(
+        `INSERT INTO events (id, type, agent_id, task_id, message, metadata, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [
+          uuidv4(),
+          'task_dispatched',
+          agent.id,
+          task.id,
+          `Task "${task.title}" dispatched to ${agent.name} through Codex`,
+          JSON.stringify({ runtime: 'codex', codex_session_id: codexRun.sessionId }),
+          now,
+        ]
+      );
+
+      run(
+        `INSERT INTO task_activities (id, task_id, agent_id, activity_type, message, metadata, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [
+          crypto.randomUUID(),
+          task.id,
+          agent.id,
+          'status_changed',
+          `Task dispatched to ${agent.name} through Codex - Codex is now working on this task`,
+          JSON.stringify({
+            runtime: 'codex',
+            codex_session_id: codexRun.sessionId,
+            pid: codexRun.pid,
+            cwd: codexRun.cwd,
+            log_path: codexRun.logPath,
+          }),
+          now,
+        ]
+      );
+
+      return NextResponse.json({
+        success: true,
+        runtime: 'codex',
+        task_id: task.id,
+        agent_id: agent.id,
+        session_id: codexRun.sessionId,
+        codex_session_id: codexRun.sessionId,
+        message: 'Task dispatched to Codex',
+        ...(costCapWarning ? { cost_cap_warning: costCapWarning } : {}),
+      });
+    }
+
+    // Connect to OpenClaw Gateway only when the configured runtime is OpenClaw.
+    const client = getOpenClawClient();
+    if (!client.isConnected()) {
+      try {
+        await client.connect();
+      } catch (err) {
+        console.error('Failed to connect to OpenClaw Gateway:', err);
+        client.forceReconnect();
+        return dispatchErrorResponse(id, 'Failed to connect to OpenClaw Gateway', 503);
+      }
+    }
+
+    // Get or create OpenClaw session for this agent + task combination
+    let session = queryOne<OpenClawSession>(
+      'SELECT * FROM openclaw_sessions WHERE agent_id = ? AND task_id = ? AND status = ?',
+      [agent.id, id, 'active']
+    );
+    const reusedExistingSession = Boolean(session);
+
+    if (!session) {
+      // Create session record
+      const sessionId = uuidv4();
+      const openclawSessionId = `mission-control-${agent.name.toLowerCase().replace(/\s+/g, '-')}-${id}`;
+
+      run(
+        `INSERT INTO openclaw_sessions (id, agent_id, openclaw_session_id, task_id, channel, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [sessionId, agent.id, openclawSessionId, id, 'mission-control', 'active', now, now]
+      );
+
+      session = queryOne<OpenClawSession>(
+        'SELECT * FROM openclaw_sessions WHERE id = ?',
+        [sessionId]
+      );
+
+      // Log session creation
+      run(
+        `INSERT INTO events (id, type, agent_id, message, created_at)
+         VALUES (?, ?, ?, ?, ?)`,
+        [uuidv4(), 'agent_status_changed', agent.id, `${agent.name} session created`, now]
+      );
+    }
+
+    if (!session) {
+      return dispatchErrorResponse(id, 'Failed to create agent session', 500);
+    }
+
+    console.info('[Dispatch] Agent session resolved for task dispatch', JSON.stringify({
+      runtime: 'openclaw',
+      taskId: id,
+      taskStatus: task.status,
+      agentId: agent.id,
+      agentName: agent.name,
+      reusedExistingSession,
+      sessionId: session.openclaw_session_id,
+      sessionCreatedAt: session.created_at,
+      sessionUpdatedAt: session.updated_at,
+    }));
 
     // Send message to agent's session using chat.send
     try {

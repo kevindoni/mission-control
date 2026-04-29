@@ -31,7 +31,7 @@ export interface CodexCliStatus {
   checkedAt: string;
 }
 
-const CODEX_COMMAND = process.env.CODEX_CLI_PATH || 'codex';
+export const CODEX_COMMAND = process.env.CODEX_CLI_PATH || 'codex';
 const LOGIN_COMMAND = `${CODEX_COMMAND} login --device-auth`;
 
 function cleanOutput(output: string): string {

@@ -3,6 +3,7 @@ import { queryOne, queryAll, run } from '@/lib/db';
 import { broadcast } from '@/lib/events';
 import { getMissionControlUrl } from '@/lib/config';
 import { buildCheckpointContext } from '@/lib/checkpoint';
+import { cancelCodexRunsForTask } from '@/lib/codex/dispatch';
 import type { Agent, AgentHealth, AgentHealthState, SemanticAgentHealthState, Task } from '@/lib/types';
 
 const RECENT_SIGNAL_MINUTES = 5;
@@ -35,9 +36,10 @@ interface NoteSignal extends TimedRow {
 
 interface SessionSignal {
   id: string;
+  runtime: 'openclaw' | 'codex';
+  session_id: string;
   status: string;
   session_type: string;
-  openclaw_session_id: string;
   created_at: string;
   updated_at: string;
 }
@@ -158,15 +160,37 @@ function getActiveTaskForAgent(agentId: string): Task | undefined {
   );
 }
 
-function getSignals(task: Task, agentId: string) {
-  const sessions = queryAll<SessionSignal>(
-    `SELECT * FROM openclaw_sessions
+function isActiveSession(session: SessionSignal): boolean {
+  return session.status === 'active' || session.status === 'running';
+}
+
+function formatSessionId(session: SessionSignal): string {
+  return `${session.runtime}:${session.session_id}`;
+}
+
+function getRuntimeSessions(agentId: string, taskId: string): SessionSignal[] {
+  return queryAll<SessionSignal>(
+    `SELECT id, 'openclaw' AS runtime, openclaw_session_id AS session_id, status, session_type, created_at, updated_at
+     FROM openclaw_sessions
      WHERE agent_id = ?
        AND (task_id = ? OR task_id IS NULL)
+     UNION ALL
+     SELECT id, 'codex' AS runtime, id AS session_id, status, 'codex' AS session_type, created_at, updated_at
+     FROM codex_sessions
+     WHERE agent_id = ?
+       AND task_id = ?
      ORDER BY created_at DESC`,
-    [agentId, task.id]
+    [agentId, taskId, agentId, taskId]
   );
-  const activeSession = sessions.find(s => s.status === 'active');
+}
+
+function getActiveRuntimeSessions(agentId: string, taskId: string): SessionSignal[] {
+  return getRuntimeSessions(agentId, taskId).filter(isActiveSession);
+}
+
+function getSignals(task: Task, agentId: string) {
+  const sessions = getRuntimeSessions(agentId, task.id);
+  const activeSession = sessions.find(isActiveSession);
 
   const activities = queryAll<ActivitySignal>(
     `SELECT id, activity_type, message, created_at
@@ -253,7 +277,7 @@ function buildEvaluation(
     signals: {
       task_status: activeTask?.status,
       has_active_session: Boolean(signals?.activeSession),
-      active_session_id: signals?.activeSession?.openclaw_session_id,
+      active_session_id: signals?.activeSession?.session_id,
       active_session_created_at: normalizeTimestamp(signals?.activeSession?.created_at),
       active_session_updated_at: normalizeTimestamp(signals?.activeSession?.updated_at),
       latest_activity_at: latestActivityAt,
@@ -320,7 +344,7 @@ export function evaluateAgentHealth(agentId: string): AgentHealthEvaluation {
       'no_heartbeat',
       'No active session',
       'danger',
-      'The task is active, but Mission Control has no active OpenClaw session recorded for the assigned agent.',
+      'The task is active, but Mission Control has no active runtime session recorded for the assigned agent.',
       0.9,
       activeTask,
       signals,
@@ -670,13 +694,7 @@ export async function nudgeAgent(agentId: string): Promise<{ success: boolean; e
 
   const now = new Date().toISOString();
   const missionControlUrl = getMissionControlUrl();
-  const activeSessionsBefore = queryAll<SessionSignal>(
-    `SELECT id, status, session_type, openclaw_session_id, created_at, updated_at
-     FROM openclaw_sessions
-     WHERE agent_id = ? AND task_id = ? AND status = 'active'
-     ORDER BY created_at DESC`,
-    [agentId, activeTask.id]
-  );
+  const activeSessionsBefore = getActiveRuntimeSessions(agentId, activeTask.id);
 
   console.warn('[Health][Nudge] Starting auto-nudge', JSON.stringify({
     agentId,
@@ -685,20 +703,23 @@ export async function nudgeAgent(agentId: string): Promise<{ success: boolean; e
     missionControlUrl,
     hasApiToken: Boolean(process.env.MC_API_TOKEN),
     activeSessionCountBefore: activeSessionsBefore.length,
-    activeSessionIdsBefore: activeSessionsBefore.map(s => s.openclaw_session_id),
+    activeSessionIdsBefore: activeSessionsBefore.map(formatSessionId),
   }));
 
   const recoveryStatus = activeTask.status === 'in_progress' ? 'assigned' : activeTask.status;
 
   // End only this task's current session before replacing it.
-  const endResult = run(
+  const openClawEndResult = run(
     `UPDATE openclaw_sessions SET status = 'ended', ended_at = ?, updated_at = ? WHERE agent_id = ? AND task_id = ? AND status = 'active'`,
     [now, now, agentId, activeTask.id]
   );
+  const cancelledCodexRuns = cancelCodexRunsForTask(activeTask.id, agentId);
   console.warn('[Health][Nudge] Ended active sessions before re-dispatch', JSON.stringify({
     agentId,
     taskId: activeTask.id,
-    endedSessionCount: endResult.changes,
+    endedSessionCount: openClawEndResult.changes + cancelledCodexRuns,
+    endedOpenClawSessionCount: openClawEndResult.changes,
+    cancelledCodexRunCount: cancelledCodexRuns,
     recoveryStatus,
   }));
 
@@ -751,13 +772,7 @@ export async function nudgeAgent(agentId: string): Promise<{ success: boolean; e
          WHERE id = ?`,
         [activeTask.id]
       );
-      const activeSessionsAfter = queryAll<SessionSignal>(
-        `SELECT id, status, session_type, openclaw_session_id, created_at, updated_at
-         FROM openclaw_sessions
-         WHERE agent_id = ? AND task_id = ? AND status = 'active'
-         ORDER BY created_at DESC`,
-        [agentId, activeTask.id]
-      );
+      const activeSessionsAfter = getActiveRuntimeSessions(agentId, activeTask.id);
 
       console.warn('[Health][Nudge] Post-dispatch state', JSON.stringify({
         agentId,
@@ -768,7 +783,7 @@ export async function nudgeAgent(agentId: string): Promise<{ success: boolean; e
         planningDispatchError: postDispatchTask?.planning_dispatch_error || null,
         statusReason: postDispatchTask?.status_reason || null,
         activeSessionCountAfter: activeSessionsAfter.length,
-        activeSessionIdsAfter: activeSessionsAfter.map(s => s.openclaw_session_id),
+        activeSessionIdsAfter: activeSessionsAfter.map(formatSessionId),
       }));
 
       if (res.ok && activeSessionsAfter.length > 0) {

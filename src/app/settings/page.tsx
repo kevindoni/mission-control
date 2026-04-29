@@ -960,6 +960,7 @@ export default function SettingsPage() {
             <li><code>OPENCLAW_GATEWAY_TOKEN</code> - Gateway auth token</li>
             <li><code>AGENT_RUNTIME_PROVIDER</code> - Runtime provider override (<code>openclaw</code> or <code>codex</code>)</li>
             <li><code>CODEX_CLI_PATH</code> - Codex CLI executable path</li>
+            <li><code>CODEX_DISPATCH_SANDBOX</code> - Codex CLI dispatch sandbox mode</li>
             <li><code>CODEX_CLOUD_ENV_ID</code> - Codex Cloud environment ID</li>
             <li><code>CODEX_DEFAULT_BRANCH</code> - Default branch for Codex Cloud runs</li>
             <li><code>S3_ENDPOINT</code>, <code>S3_BUCKET</code>, <code>S3_ACCESS_KEY</code>, <code>S3_SECRET_KEY</code> - S3 backup storage</li>
