@@ -4,18 +4,14 @@ import { queryOne, queryAll, run } from '@/lib/db';
 import { getOpenClawClient } from '@/lib/openclaw/client';
 import { broadcast } from '@/lib/events';
 import { getProjectsPath, getMissionControlUrl } from '@/lib/config';
-import { getRelevantKnowledge, formatKnowledgeForDispatch } from '@/lib/learner';
-import { getTaskWorkflow } from '@/lib/workflow-engine';
 import { syncGatewayAgentsToCatalog } from '@/lib/agent-catalog-sync';
 import { pickDynamicAgent } from '@/lib/task-governance';
-import { buildCheckpointContext } from '@/lib/checkpoint';
-import { formatMailForDispatch } from '@/lib/mailbox';
-import { getPendingNotesForDispatch } from '@/lib/task-notes';
 import { createTaskWorkspace, determineIsolationStrategy } from '@/lib/workspace-isolation';
 import { getAgentRuntimeSettings } from '@/lib/runtime-settings';
 import { getCodexCliStatus } from '@/lib/codex/status';
 import { cancelCodexRunsForTask, startCodexTaskRun } from '@/lib/codex/dispatch';
-import type { Task, Agent, Product, OpenClawSession, WorkflowStage, TaskImage } from '@/lib/types';
+import { buildTaskDispatchContext } from '@/lib/task-dispatch-context';
+import type { Task, Agent, Product, OpenClawSession } from '@/lib/types';
 
 export const dynamic = 'force-dynamic';
 interface RouteParams {
@@ -151,14 +147,6 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       }
     }
 
-    // Build task message for agent
-    const priorityEmoji = {
-      low: '🔵',
-      normal: '⚪',
-      high: '🟡',
-      urgent: '🔴'
-    }[task.priority] || '⚪';
-
     // Get project path for deliverables — with workspace isolation if needed
     const projectsPath = getProjectsPath();
     const projectDir = task.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
@@ -185,223 +173,16 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       }
     }
 
-    // Parse planning_spec and planning_agents if present (stored as JSON text on the task row)
-    const rawTask = task as Task & { assigned_agent_name?: string; workspace_id: string; planning_spec?: string; planning_agents?: string };
-    let planningSpecSection = '';
-    let agentInstructionsSection = '';
-
-    if (rawTask.planning_spec) {
-      try {
-        const spec = JSON.parse(rawTask.planning_spec);
-        // planning_spec may be an object with spec_markdown, or a raw string
-        const specText = typeof spec === 'string' ? spec : (spec.spec_markdown || JSON.stringify(spec, null, 2));
-        planningSpecSection = `\n---\n**📋 PLANNING SPECIFICATION:**\n${specText}\n`;
-      } catch {
-        // If not valid JSON, treat as plain text
-        planningSpecSection = `\n---\n**📋 PLANNING SPECIFICATION:**\n${rawTask.planning_spec}\n`;
-      }
-    }
-
-    if (rawTask.planning_agents) {
-      try {
-        const agents = JSON.parse(rawTask.planning_agents);
-        if (Array.isArray(agents)) {
-          // Find instructions for this specific agent, or include all if none match
-          const myInstructions = agents.find(
-            (a: { agent_id?: string; name?: string; instructions?: string }) =>
-              a.agent_id === agent.id || a.name === agent.name
-          );
-          if (myInstructions?.instructions) {
-            agentInstructionsSection = `\n**🎯 YOUR INSTRUCTIONS:**\n${myInstructions.instructions}\n`;
-          } else {
-            // Include all agent instructions for context
-            const allInstructions = agents
-              .filter((a: { instructions?: string }) => a.instructions)
-              .map((a: { name?: string; role?: string; instructions?: string }) =>
-                `- **${a.name || a.role || 'Agent'}:** ${a.instructions}`
-              )
-              .join('\n');
-            if (allInstructions) {
-              agentInstructionsSection = `\n**🎯 AGENT INSTRUCTIONS:**\n${allInstructions}\n`;
-            }
-          }
-        }
-      } catch {
-        // Ignore malformed planning_agents JSON
-      }
-    }
-
-    // Inject relevant knowledge from the learner knowledge base
-    let knowledgeSection = '';
-    try {
-      const knowledge = getRelevantKnowledge(task.workspace_id, task.title);
-      knowledgeSection = formatKnowledgeForDispatch(knowledge);
-    } catch {
-      // Knowledge injection is best-effort
-    }
-
-    // Inject matched product skills (proven procedures from previous tasks)
-    let skillsSection = '';
-    if (task.product_id) {
-      try {
-        const { getMatchedSkills, formatSkillsForDispatch } = await import('@/lib/skills');
-        const skills = getMatchedSkills(task.product_id, task.title, task.description || '', agent.name);
-        skillsSection = formatSkillsForDispatch(skills);
-      } catch {
-        // Skills injection is best-effort
-      }
-    }
-
-    // Determine role-specific instructions based on workflow template
-    const workflow = getTaskWorkflow(id);
-    let currentStage: WorkflowStage | undefined;
-    let nextStage: WorkflowStage | undefined;
-    if (workflow) {
-      let stageIndex = workflow.stages.findIndex(s => s.status === task.status);
-      // 'assigned' isn't a workflow stage — resolve to the 'build' stage (in_progress)
-      if (stageIndex < 0 && (task.status === 'assigned' || task.status === 'inbox')) {
-        stageIndex = workflow.stages.findIndex(s => s.role === 'builder');
-      }
-      if (stageIndex >= 0) {
-        currentStage = workflow.stages[stageIndex];
-        nextStage = workflow.stages[stageIndex + 1];
-      }
-    }
-
-    const isBuilder = !currentStage || currentStage.role === 'builder' || task.status === 'assigned';
-    const isTester = currentStage?.role === 'tester';
-    const isVerifier = currentStage?.role === 'verifier' || currentStage?.role === 'reviewer';
-    const nextStatus = nextStage?.status || 'review';
-    const failEndpoint = `POST ${missionControlUrl}/api/tasks/${task.id}/fail`;
-
-    let completionInstructions: string;
-    if (isBuilder) {
-      completionInstructions = `**IMPORTANT:** After completing work, you MUST call these APIs:
-1. Log activity: POST ${missionControlUrl}/api/tasks/${task.id}/activities
-   Body: {"activity_type": "completed", "message": "Description of what was done"}
-2. Register deliverable: POST ${missionControlUrl}/api/tasks/${task.id}/deliverables
-   Body: {"deliverable_type": "file", "title": "File name", "path": "${taskProjectDir}/filename.html"}
-3. Update status: PATCH ${missionControlUrl}/api/tasks/${task.id}
-   Body: {"status": "${nextStatus}"}
-
-When complete, reply with:
-\`TASK_COMPLETE: [brief summary of what you did]\``;
-    } else if (isTester) {
-      completionInstructions = `**YOUR ROLE: TESTER** — Test the deliverables for this task.
-
-Review the output directory for deliverables and run any applicable tests.
-
-**If tests PASS:**
-1. Log activity: POST ${missionControlUrl}/api/tasks/${task.id}/activities
-   Body: {"activity_type": "completed", "message": "Tests passed: [summary]"}
-2. Update status: PATCH ${missionControlUrl}/api/tasks/${task.id}
-   Body: {"status": "${nextStatus}"}
-
-**If tests FAIL:**
-1. ${failEndpoint}
-   Body: {"reason": "Detailed description of what failed and what needs fixing"}
-
-Reply with: \`TEST_PASS: [summary]\` or \`TEST_FAIL: [what failed]\``;
-    } else if (isVerifier) {
-      completionInstructions = `**YOUR ROLE: VERIFIER** — Verify that all work meets quality standards.
-
-Review deliverables, test results, and task requirements.
-
-**If verification PASSES:**
-1. Log activity: POST ${missionControlUrl}/api/tasks/${task.id}/activities
-   Body: {"activity_type": "completed", "message": "Verification passed: [summary]"}
-2. Update status: PATCH ${missionControlUrl}/api/tasks/${task.id}
-   Body: {"status": "${nextStatus}"}
-
-**If verification FAILS:**
-1. ${failEndpoint}
-   Body: {"reason": "Detailed description of what failed and what needs fixing"}
-
-Reply with: \`VERIFY_PASS: [summary]\` or \`VERIFY_FAIL: [what failed]\``;
-    } else {
-      // Fallback for unknown roles
-      completionInstructions = `**IMPORTANT:** After completing work:
-1. Update status: PATCH ${missionControlUrl}/api/tasks/${task.id}
-   Body: {"status": "${nextStatus}"}`;
-    }
-
-    // Build image references section
-    let imagesSection = '';
-    if (task.images) {
-      try {
-        const images: TaskImage[] = JSON.parse(task.images);
-        if (images.length > 0) {
-          const imageList = images
-            .map(img => `- ${img.original_name}: ${missionControlUrl}/api/task-images/${task.id}/${img.filename}`)
-            .join('\n');
-          imagesSection = `\n**Reference Images:**\n${imageList}\n`;
-        }
-      } catch {
-        // Ignore malformed images JSON
-      }
-    }
-
-    // Build repo/PR section for builder agents when task has a repo
-    let repoSection = '';
-    if ((task as Task & { repo_url?: string }).repo_url && isBuilder) {
-      const repoUrl = (task as Task & { repo_url?: string }).repo_url!;
-      const repoBranch = (task as Task & { repo_branch?: string }).repo_branch || 'main';
-      const branchName = `autopilot/${task.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 50)}`;
-
-      repoSection = `
----
-**\u{1F517} REPOSITORY:**
-- **Repo:** ${repoUrl}
-- **Base branch:** ${repoBranch}
-- **Feature branch:** ${branchName}
-
-**GIT WORKFLOW:**
-1. First, verify you have git access: run \`git ls-remote ${repoUrl}\`
-   - If this fails, report the error immediately via:
-     PATCH ${missionControlUrl}/api/tasks/${task.id}
-     Body: {"status_reason": "Git auth not configured: [error message]"}
-     Then STOP — do not proceed without repo access.
-2. Clone the repo (or use existing local copy)
-3. Create branch \`${branchName}\` from \`${repoBranch}\`
-4. Implement the feature
-5. Commit with clear messages (reference task: ${task.id})
-6. Push branch and create a Pull Request
-
-**PR REQUIREMENTS:**
-- Title: "\u{1F916} Autopilot: ${task.title}"
-- Body must include:
-  - What was built and why
-  - Research backing (from the idea)
-  - Technical approach taken
-  - Any risks or trade-offs
-  - Task ID: ${task.id}
-- Target branch: ${repoBranch}
-- After creating PR, report the PR URL:
-  PATCH ${missionControlUrl}/api/tasks/${task.id}
-  Body: {"pr_url": "<github PR url>", "pr_status": "open"}
-`;
-    }
-
-    const roleLabel = currentStage?.label || 'Task';
-    const taskMessage = `${priorityEmoji} **${isBuilder ? 'NEW TASK ASSIGNED' : `${roleLabel.toUpperCase()} STAGE — ${task.title}`}**
-
-**Title:** ${task.title}
-${task.description ? `**Description:** ${task.description}\n` : ''}
-**Priority:** ${task.priority.toUpperCase()}
-${task.due_date ? `**Due:** ${task.due_date}\n` : ''}
-**Task ID:** ${task.id}
-${planningSpecSection}${agentInstructionsSection}${skillsSection}${knowledgeSection}${imagesSection}${buildCheckpointContext(task.id) || ''}${formatMailForDispatch(agent.id) || ''}${repoSection}
-${isBuilder ? (workspaceIsolated
-  ? `**\u{1F512} ISOLATED WORKSPACE:** ${taskProjectDir}\n- **Port:** ${workspacePort || 'default'} (use this for dev server, NOT the default)\n${workspaceBranchName ? `- **Branch:** ${workspaceBranchName}\n` : ''}- **IMPORTANT:** Do NOT modify files outside this workspace directory. Other agents may be working on the same project in parallel. All your work must stay within: ${taskProjectDir}\nCreate this directory if needed and save all deliverables there.\n`
-  : `**OUTPUT DIRECTORY:** ${taskProjectDir}\nCreate this directory and save all deliverables there.\n`)
-: `**OUTPUT DIRECTORY:** ${taskProjectDir}\n`}
-${completionInstructions}
-
-If you need help or clarification, ask the orchestrator.`;
-
-    // Inject any pending operator notes (queued via /btw chat)
-    const { formatted: pendingNotes } = getPendingNotesForDispatch(id);
-    const finalMessage = pendingNotes ? taskMessage + pendingNotes : taskMessage;
+    const dispatchContext = buildTaskDispatchContext({
+      task: task as Task,
+      agent,
+      missionControlUrl,
+      taskProjectDir,
+      workspaceIsolated,
+      workspaceBranchName,
+      workspacePort,
+    });
+    const finalMessage = dispatchContext.message;
 
     const runtimeSettings = getAgentRuntimeSettings();
 
@@ -448,6 +229,13 @@ ${finalMessage}`;
         pid: codexRun.pid,
         cwd: codexRun.cwd,
         cancelledRuns,
+        contextVersion: dispatchContext.audit.version,
+        contextChars: dispatchContext.audit.totalChars,
+        contextSections: dispatchContext.audit.sections.map(section => ({
+          key: section.key,
+          chars: section.charCount,
+          truncated: section.truncated,
+        })),
       }));
 
       if (task.status === 'assigned') {
@@ -484,7 +272,11 @@ ${finalMessage}`;
           agent.id,
           task.id,
           `Task "${task.title}" dispatched to ${agent.name} through Codex`,
-          JSON.stringify({ runtime: 'codex', codex_session_id: codexRun.sessionId }),
+          JSON.stringify({
+            runtime: 'codex',
+            codex_session_id: codexRun.sessionId,
+            context: dispatchContext.audit,
+          }),
           now,
         ]
       );
@@ -504,6 +296,7 @@ ${finalMessage}`;
             pid: codexRun.pid,
             cwd: codexRun.cwd,
             log_path: codexRun.logPath,
+            context: dispatchContext.audit,
           }),
           now,
         ]
@@ -516,6 +309,7 @@ ${finalMessage}`;
         agent_id: agent.id,
         session_id: codexRun.sessionId,
         codex_session_id: codexRun.sessionId,
+        context_version: dispatchContext.audit.version,
         message: 'Task dispatched to Codex',
         ...(costCapWarning ? { cost_cap_warning: costCapWarning } : {}),
       });
@@ -568,7 +362,7 @@ ${finalMessage}`;
       return dispatchErrorResponse(id, 'Failed to create agent session', 500);
     }
 
-    console.info('[Dispatch] Agent session resolved for task dispatch', JSON.stringify({
+      console.info('[Dispatch] Agent session resolved for task dispatch', JSON.stringify({
       runtime: 'openclaw',
       taskId: id,
       taskStatus: task.status,
@@ -578,6 +372,13 @@ ${finalMessage}`;
       sessionId: session.openclaw_session_id,
       sessionCreatedAt: session.created_at,
       sessionUpdatedAt: session.updated_at,
+      contextVersion: dispatchContext.audit.version,
+      contextChars: dispatchContext.audit.totalChars,
+      contextSections: dispatchContext.audit.sections.map(section => ({
+        key: section.key,
+        chars: section.charCount,
+        truncated: section.truncated,
+      })),
     }));
 
     // Send message to agent's session using chat.send
@@ -640,17 +441,41 @@ ${finalMessage}`;
       // Log dispatch event to events table
       const eventId = uuidv4();
       run(
-        `INSERT INTO events (id, type, agent_id, task_id, message, created_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [eventId, 'task_dispatched', agent.id, task.id, `Task "${task.title}" dispatched to ${agent.name}`, now]
+        `INSERT INTO events (id, type, agent_id, task_id, message, metadata, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [
+          eventId,
+          'task_dispatched',
+          agent.id,
+          task.id,
+          `Task "${task.title}" dispatched to ${agent.name}`,
+          JSON.stringify({
+            runtime: 'openclaw',
+            openclaw_session_id: session.openclaw_session_id,
+            context: dispatchContext.audit,
+          }),
+          now,
+        ]
       );
 
       // Log dispatch activity to task_activities table (for Activity tab)
       const activityId = crypto.randomUUID();
       run(
-        `INSERT INTO task_activities (id, task_id, agent_id, activity_type, message, created_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [activityId, task.id, agent.id, 'status_changed', `Task dispatched to ${agent.name} - Agent is now working on this task`, now]
+        `INSERT INTO task_activities (id, task_id, agent_id, activity_type, message, metadata, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [
+          activityId,
+          task.id,
+          agent.id,
+          'status_changed',
+          `Task dispatched to ${agent.name} - Agent is now working on this task`,
+          JSON.stringify({
+            runtime: 'openclaw',
+            openclaw_session_id: session.openclaw_session_id,
+            context: dispatchContext.audit,
+          }),
+          now,
+        ]
       );
 
       return NextResponse.json({
@@ -658,6 +483,7 @@ ${finalMessage}`;
         task_id: task.id,
         agent_id: agent.id,
         session_id: session.openclaw_session_id,
+        context_version: dispatchContext.audit.version,
         message: 'Task dispatched to agent',
         ...(costCapWarning ? { cost_cap_warning: costCapWarning } : {}),
       });

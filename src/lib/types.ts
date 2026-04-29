@@ -73,6 +73,9 @@ export interface Task {
   planning_complete?: number;
   planning_dispatch_error?: string;
   planning_session_key?: string;
+  planning_messages?: string;
+  planning_spec?: string;
+  planning_agents?: string;
   images?: string; // JSON array of TaskImage objects
   convoy_id?: string;
   is_subtask?: number;
