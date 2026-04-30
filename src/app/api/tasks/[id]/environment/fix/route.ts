@@ -1,4 +1,5 @@
 import { exec, type ExecException } from 'child_process';
+import { createHash } from 'crypto';
 import { NextRequest, NextResponse } from 'next/server';
 import { queryAll, queryOne, run } from '@/lib/db';
 import { broadcast } from '@/lib/events';
@@ -45,6 +46,7 @@ interface EnvironmentFixRun {
   command: string;
   commandSource: string;
   retry: boolean;
+  generation: number;
 }
 
 interface EnvironmentFixMetadata {
@@ -54,6 +56,9 @@ interface EnvironmentFixMetadata {
   command?: string;
   commandSource?: string;
   error?: string;
+  failureFingerprint?: string;
+  generation?: number;
+  repeatedFailure?: boolean;
   stdout?: string;
   stderr?: string;
   timeoutMs?: number;
@@ -67,8 +72,11 @@ interface EnvironmentRecoveryAttempt {
   status: EnvironmentRecoveryAttemptStatus;
   command?: string;
   commandSource?: string;
+  generation: number;
   message: string;
   error?: string;
+  failureFingerprint?: string;
+  repeatedFailure?: boolean;
   stdout?: string;
   stderr?: string;
   suggestion?: EnvironmentCommandSuggestion | null;
@@ -80,7 +88,9 @@ interface EnvironmentRecoveryState {
   running: boolean;
   runningFix?: { command: string; startedAt: string };
   attempts: EnvironmentRecoveryAttempt[];
+  generation: number;
   failedCommands: string[];
+  repeatedFailures: Array<{ command: string; generation: number; firstGeneration: number; failureFingerprint: string }>;
   nextSuggestion?: EnvironmentCommandSuggestion | null;
 }
 
@@ -100,6 +110,26 @@ function safeJsonParse<T = unknown>(value: string | null | undefined): T | null 
   } catch {
     return null;
   }
+}
+
+function normalizeFailureText(value: string | undefined): string {
+  return (value || '')
+    .toLowerCase()
+    .replace(/\b\d{4}-\d{2}-\d{2}[t\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?z?\b/g, '<timestamp>')
+    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/g, '<uuid>')
+    .replace(/\b0x[0-9a-f]+\b/g, '<hex>')
+    .replace(/\[[^\]]*?\d+:\d+[^\]]*?\]/g, '[process]')
+    .replace(/\bpid\s+\d+\b/g, 'pid <num>')
+    .replace(/\b\d{4,}\b/g, '<num>')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 4000);
+}
+
+function createFailureFingerprint(value: string | undefined): string | undefined {
+  const normalized = normalizeFailureText(value);
+  if (!normalized) return undefined;
+  return createHash('sha256').update(normalized).digest('hex').slice(0, 16);
 }
 
 function formatCommandFailure(
@@ -203,10 +233,14 @@ function buildRecoveryState(taskId: string, issue: EnvironmentIssue): Environmen
   const runningFix = getRunningEnvironmentFix(taskId);
   const activities = getEnvironmentFixActivities(taskId).reverse();
   const attempts: EnvironmentRecoveryAttempt[] = [];
+  const firstFailureByCommandAndFingerprint = new Map<string, { generation: number }>();
+  const repeatedFailures: EnvironmentRecoveryState['repeatedFailures'] = [];
+  let generation = 0;
 
   for (const activity of activities) {
     const metadata = safeJsonParse<EnvironmentFixMetadata>(activity.metadata);
     const command = commandFromActivity(activity, metadata);
+    const metadataGeneration = typeof metadata?.generation === 'number' ? metadata.generation : undefined;
 
     if (activity.activity_type === 'environment_fix_started') {
       attempts.push({
@@ -215,6 +249,7 @@ function buildRecoveryState(taskId: string, issue: EnvironmentIssue): Environmen
         status: 'running',
         command,
         commandSource: metadata?.commandSource,
+        generation: metadataGeneration ?? generation,
         message: activity.message,
         suggestion: metadata?.suggestion,
       });
@@ -232,11 +267,46 @@ function buildRecoveryState(taskId: string, issue: EnvironmentIssue): Environmen
         normalizeCommand(attempt.command) === normalizeCommand(command)
       ))
       : undefined;
+    const attemptGeneration = metadataGeneration ?? matchingAttempt?.generation ?? generation;
+    const failureFingerprint = metadata?.failureFingerprint || (
+      status === 'failed' || status === 'retry_failed'
+        ? createFailureFingerprint(metadata?.error || metadata?.stderr || metadata?.stdout || activity.message)
+        : undefined
+    );
+    let repeatedFailure = Boolean(metadata?.repeatedFailure);
+    const normalizedCommand = normalizeCommand(command);
+
+    if ((status === 'failed' || status === 'retry_failed') && normalizedCommand && failureFingerprint) {
+      const key = `${normalizedCommand}\0${failureFingerprint}`;
+      const firstFailure = firstFailureByCommandAndFingerprint.get(key);
+      if (firstFailure && firstFailure.generation < attemptGeneration) {
+        repeatedFailure = true;
+        if (!repeatedFailures.some((failure) => (
+          failure.command === normalizedCommand &&
+          failure.failureFingerprint === failureFingerprint &&
+          failure.generation === attemptGeneration
+        ))) {
+          repeatedFailures.push({
+            command: normalizedCommand,
+            generation: attemptGeneration,
+            firstGeneration: firstFailure.generation,
+            failureFingerprint,
+          });
+        }
+      }
+      if (!firstFailure) {
+        firstFailureByCommandAndFingerprint.set(key, { generation: attemptGeneration });
+      }
+    }
+
     const patch: Partial<EnvironmentRecoveryAttempt> = {
       status,
       message: activity.message,
       command,
+      generation: attemptGeneration,
       error: metadata?.error,
+      failureFingerprint,
+      repeatedFailure,
       stdout: metadata?.stdout,
       stderr: metadata?.stderr,
       suggestion: metadata?.suggestion,
@@ -252,12 +322,19 @@ function buildRecoveryState(taskId: string, issue: EnvironmentIssue): Environmen
         status,
         message: activity.message,
         command,
+        generation: attemptGeneration,
         error: metadata?.error,
+        failureFingerprint,
+        repeatedFailure,
         stdout: metadata?.stdout,
         stderr: metadata?.stderr,
         suggestion: metadata?.suggestion,
         nextSuggestion: metadata?.nextSuggestion,
       });
+    }
+
+    if (status === 'completed') {
+      generation = Math.max(generation, attemptGeneration + 1);
     }
   }
 
@@ -272,21 +349,32 @@ function buildRecoveryState(taskId: string, issue: EnvironmentIssue): Environmen
 
   const failedCommands = Array.from(new Set(
     attempts
-      .filter((attempt) => attempt.status === 'failed' || attempt.status === 'retry_failed')
+      .filter((attempt) => (
+        (attempt.status === 'failed' || attempt.status === 'retry_failed') &&
+        attempt.generation === generation
+      ))
       .map((attempt) => normalizeCommand(attempt.command))
       .filter((command): command is string => Boolean(command))
   ));
+  const failedCommandSet = new Set(failedCommands);
   const latestNextSuggestion = [...attempts]
     .reverse()
+    .filter((attempt) => attempt.generation === generation)
     .map((attempt) => attempt.nextSuggestion)
-    .find((suggestion) => suggestion?.canFixWithCommand && suggestion.command);
+    .find((suggestion) => (
+      suggestion?.canFixWithCommand &&
+      suggestion.command &&
+      !failedCommandSet.has(normalizeCommand(suggestion.command) || '')
+    ));
 
   return {
     issue,
     running: Boolean(runningFix),
     runningFix: runningFix || undefined,
     attempts: attempts.reverse(),
+    generation,
     failedCommands,
+    repeatedFailures,
     nextSuggestion: latestNextSuggestion || null,
   };
 }
@@ -336,11 +424,12 @@ async function finishEnvironmentFix(
   stdout: string | Buffer | undefined,
   stderr: string | Buffer | undefined
 ) {
-  const { task, issue, suggestion, command, retry } = runConfig;
+  const { task, issue, suggestion, command, retry, generation } = runConfig;
   runningEnvironmentFixes.delete(task.id);
 
   if (error) {
     const message = formatCommandFailure(command, error, stdout, stderr);
+    const failureFingerprint = createFailureFingerprint(message);
     const planningError = `Environment fix failed (${issue.code}): ${message}`;
     updateTaskState(
       task.id,
@@ -353,6 +442,8 @@ async function finishEnvironmentFix(
       suggestion,
       command,
       error: message,
+      failureFingerprint,
+      generation,
     };
     const failureActivityId = recordActivity(
       task.id,
@@ -372,7 +463,7 @@ async function finishEnvironmentFix(
         issue: nextIssue,
         activities: contextActivities,
         requestText: message,
-        attemptedCommands: recovery.failedCommands,
+        blockedCommands: recovery.failedCommands,
       });
 
       if (nextSuggestion.canFixWithCommand && nextSuggestion.command) {
@@ -383,6 +474,16 @@ async function finishEnvironmentFix(
         updateTaskState(
           task.id,
           `Environment fix failed: ${nextIssue.title}. Suggested next action ready.`,
+          planningError
+        );
+      } else if (recovery.repeatedFailures.some((failure) => (
+        failure.command === normalizeCommand(command) &&
+        failure.failureFingerprint === failureFingerprint &&
+        failure.generation === generation
+      ))) {
+        updateTaskState(
+          task.id,
+          `Environment fix failed again with the same error: ${nextIssue.title}. Manual intervention needed.`,
           planningError
         );
       }
@@ -398,6 +499,7 @@ async function finishEnvironmentFix(
     issue,
     suggestion,
     command,
+    generation,
     stdout: stdoutText,
     stderr: stderrText,
   });
@@ -423,7 +525,9 @@ async function finishEnvironmentFix(
       issue,
       suggestion,
       command,
+      generation,
       error: retryResult.error || 'Environment fixed, but retry failed.',
+      failureFingerprint: createFailureFingerprint(retryResult.error || 'Environment fixed, but retry failed.'),
     });
     return;
   }
@@ -434,7 +538,7 @@ async function finishEnvironmentFix(
 
 function startEnvironmentFix(runConfig: EnvironmentFixRun): { command: string; startedAt: string } {
   const startedAt = new Date().toISOString();
-  const { task, issue, suggestion, command, commandSource } = runConfig;
+  const { task, issue, suggestion, command, commandSource, generation } = runConfig;
   runningEnvironmentFixes.set(task.id, { command, startedAt });
 
   recordActivity(task.id, task.assigned_agent_id, 'environment_fix_started', `Running approved environment command: ${command}`, {
@@ -442,6 +546,7 @@ function startEnvironmentFix(runConfig: EnvironmentFixRun): { command: string; s
     suggestion,
     command,
     commandSource,
+    generation,
     timeoutMs: COMMAND_TIMEOUT_MS,
   });
 
@@ -578,7 +683,7 @@ export async function POST(
           issue,
           activities,
           requestText: body.reason,
-          attemptedCommands: recovery.failedCommands,
+          blockedCommands: recovery.failedCommands,
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Failed to suggest an environment command';
@@ -657,6 +762,7 @@ export async function POST(
       command: commandToRun,
       commandSource,
       retry: body.retry !== false,
+      generation: recovery.generation,
     });
     const updatedTask = queryOne<Task>('SELECT * FROM tasks WHERE id = ?', [taskId]);
     recovery = buildRecoveryState(taskId, issue);

@@ -103,9 +103,10 @@ export async function suggestEnvironmentFixCommand(input: {
   activities: RecentActivity[];
   requestText?: string;
   attemptedCommands?: string[];
+  blockedCommands?: string[];
 }): Promise<EnvironmentCommandSuggestion> {
-  const attemptedCommands = Array.from(new Set(
-    (input.attemptedCommands || [])
+  const blockedCommands = Array.from(new Set(
+    (input.blockedCommands || input.attemptedCommands || [])
       .map(command => normalizeCommand(cleanCommand(command)))
       .filter((command): command is string => Boolean(command))
   ));
@@ -123,11 +124,11 @@ Return only JSON with this exact shape:
 Rules:
 - Use the task logs and error text as the source of truth.
 - Prefer an exact command already present in the logs.
-- Do not return a command that already appears in "Commands already attempted".
+- Do not return a command that appears in "Commands blocked in the current recovery generation".
 - If no exact command is present, infer one only when the missing dependency/tool and host platform make the command clear.
 - The command must be one shell command line suitable for the server running Mission Control.
 - Do not include placeholders, secrets, tokens, or interactive explanation text in the command.
-- If the only clear command has already been attempted, return can_fix_with_command=false and command=null.
+- If the only clear command is blocked in the current recovery generation, return can_fix_with_command=false and command=null.
 - If a single concrete command is not clear, return can_fix_with_command=false and command=null.
 - Do not assume a specific OS, package manager, repository host, language, or framework unless the evidence below supports it.
 
@@ -152,8 +153,8 @@ ${input.requestText || ''}
 ${input.task.status_reason || ''}
 ${input.task.planning_dispatch_error || ''}
 
-Commands already attempted:
-${attemptedCommands.length > 0 ? attemptedCommands.map(command => `- ${command}`).join('\n') : '- (none)'}
+Commands blocked in the current recovery generation:
+${blockedCommands.length > 0 ? blockedCommands.map(command => `- ${command}`).join('\n') : '- (none)'}
 
 Recent activities and logs:
 ${formatActivities(input.activities)}`;
@@ -166,17 +167,17 @@ ${formatActivities(input.activities)}`;
 
   const command = cleanCommand(result.data.command);
   const normalizedCommand = normalizeCommand(command);
-  const repeatsAttemptedCommand = Boolean(
-    normalizedCommand && attemptedCommands.includes(normalizedCommand)
+  const returnsBlockedCommand = Boolean(
+    normalizedCommand && blockedCommands.includes(normalizedCommand)
   );
-  const canFixWithCommand = Boolean(result.data.can_fix_with_command && command && !repeatsAttemptedCommand);
+  const canFixWithCommand = Boolean(result.data.can_fix_with_command && command && !returnsBlockedCommand);
 
   return {
     canFixWithCommand,
     command: canFixWithCommand ? command : undefined,
     confidence: result.data.confidence,
-    rationale: repeatsAttemptedCommand
-      ? 'The only suggested command has already been attempted for this task.'
+    rationale: returnsBlockedCommand
+      ? 'The only suggested command is blocked in the current recovery generation.'
       : result.data.rationale,
   };
 }

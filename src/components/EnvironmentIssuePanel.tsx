@@ -40,8 +40,11 @@ interface EnvironmentRecoveryAttempt {
   status: 'running' | 'failed' | 'completed' | 'retry_failed' | 'stale';
   command?: string;
   commandSource?: string;
+  generation: number;
   message: string;
   error?: string;
+  failureFingerprint?: string;
+  repeatedFailure?: boolean;
   stdout?: string;
   stderr?: string;
   suggestion?: EnvironmentRecoverySuggestion | null;
@@ -52,7 +55,9 @@ interface EnvironmentRecoveryState {
   running: boolean;
   runningFix?: { command: string; startedAt: string };
   attempts: EnvironmentRecoveryAttempt[];
+  generation: number;
   failedCommands: string[];
+  repeatedFailures: Array<{ command: string; generation: number; firstGeneration: number; failureFingerprint: string }>;
   nextSuggestion?: EnvironmentRecoverySuggestion | null;
 }
 
@@ -134,6 +139,7 @@ export function EnvironmentIssuePanel({ task, compact = false, className = '' }:
   const approvedCommandRationale = recovery?.nextSuggestion?.command === approvedCommand
     ? recovery.nextSuggestion.rationale
     : undefined;
+  const repeatedFailure = recovery?.repeatedFailures?.[0];
 
   const stop = (event: MouseEvent) => {
     event.stopPropagation();
@@ -323,6 +329,18 @@ export function EnvironmentIssuePanel({ task, compact = false, className = '' }:
         </div>
       )}
 
+      {!compact && repeatedFailure && !recovery?.nextSuggestion?.command && (
+        <div className="mt-3 rounded-md border border-red-400/25 bg-red-500/10 p-2.5">
+          <div className="text-[11px] font-semibold uppercase text-red-100/80">Manual intervention needed</div>
+          <div className="mt-1 text-[11px] opacity-80">
+            The same command failed with the same error after a successful recovery step. Mission Control will not keep suggesting it automatically.
+          </div>
+          <code className="mt-2 block rounded border border-white/15 bg-black/30 px-2 py-1 text-[11px] break-all">
+            {repeatedFailure.command}
+          </code>
+        </div>
+      )}
+
       {!compact && recentAttempts.length > 0 && (
         <div className="mt-3 rounded-md border border-white/15 bg-black/15 p-2.5">
           <div className="flex items-center gap-1.5 text-[11px] font-semibold uppercase opacity-70">
@@ -336,6 +354,8 @@ export function EnvironmentIssuePanel({ task, compact = false, className = '' }:
                 <div key={attempt.id} className="border-t border-white/10 pt-2 first:border-t-0 first:pt-0">
                   <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px]">
                     <span className="font-semibold">{attemptStatusLabel(attempt.status)}</span>
+                    <span className="opacity-60">Gen {attempt.generation}</span>
+                    {attempt.repeatedFailure && <span className="text-red-100/80">same error repeated</span>}
                     <span className="opacity-60">{new Date(attempt.createdAt).toLocaleTimeString()}</span>
                   </div>
                   {attempt.command && (
