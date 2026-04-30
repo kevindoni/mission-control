@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { queryOne } from '@/lib/db';
+import { queryOne, run } from '@/lib/db';
 import { handleStageFailure, drainQueue } from '@/lib/workflow-engine';
 import { notifyLearner } from '@/lib/learner';
+import { broadcast } from '@/lib/events';
+import { classifyEnvironmentIssue } from '@/lib/environment-issues';
 import type { Task } from '@/lib/types';
 
 export const dynamic = 'force-dynamic';
@@ -40,6 +42,47 @@ export async function POST(
         { error: `Cannot fail from status: ${task.status}. Must be in ${failableStatuses.join(', ')}` },
         { status: 400 }
       );
+    }
+
+    const environmentIssue = classifyEnvironmentIssue(reason);
+    if (environmentIssue) {
+      const now = new Date().toISOString();
+      const environmentMessage = `Environment action required: ${environmentIssue.userMessage}`;
+
+      run(
+        `UPDATE tasks
+         SET planning_dispatch_error = ?,
+             status_reason = ?,
+             updated_at = ?
+         WHERE id = ?`,
+        [`Environment blocked (${environmentIssue.code}): ${reason}`, environmentMessage, now, taskId]
+      );
+
+      run(
+        `INSERT INTO task_activities (id, task_id, agent_id, activity_type, message, metadata, created_at)
+         VALUES (?, ?, ?, 'environment_blocked', ?, ?, ?)`,
+        [
+          crypto.randomUUID(),
+          taskId,
+          task.assigned_agent_id || null,
+          environmentMessage,
+          JSON.stringify({ issue: environmentIssue, original_reason: reason }),
+          now,
+        ]
+      );
+
+      const updatedTask = queryOne<Task>('SELECT * FROM tasks WHERE id = ?', [taskId]);
+      if (updatedTask) {
+        broadcast({ type: 'task_updated', payload: updatedTask });
+      }
+
+      return NextResponse.json({
+        success: true,
+        environmentBlocked: true,
+        issue: environmentIssue,
+        message: environmentIssue.userMessage,
+        task: updatedTask,
+      });
     }
 
     // Notify learner about the failure

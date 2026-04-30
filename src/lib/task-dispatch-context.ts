@@ -638,6 +638,8 @@ If tests PASS:
 If tests FAIL:
 1. ${failEndpoint}
    Body: {"reason": "Detailed description of what failed and what needs fixing"}
+   If the failure is caused by a missing local tool/dependency or repository access issue, include this exact line in the reason when you can identify a concrete command:
+   Suggested setup command: <single command to run>
 
 Reply with: TEST_PASS: [summary] or TEST_FAIL: [what failed]`;
   }
@@ -654,6 +656,8 @@ If verification PASSES:
 If verification FAILS:
 1. ${failEndpoint}
    Body: {"reason": "Detailed description of what failed and what needs fixing"}
+   If the failure is caused by a missing local tool/dependency or repository access issue, include this exact line in the reason when you can identify a concrete command:
+   Suggested setup command: <single command to run>
 
 Reply with: VERIFY_PASS: [summary] or VERIFY_FAIL: [what failed]`;
   }

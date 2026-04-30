@@ -8,6 +8,7 @@ import { getConfig } from '@/lib/config';
 import { useUnreadCounts } from '@/hooks/useUnreadCounts';
 import type { Task, TaskStatus } from '@/lib/types';
 import { TaskModal } from './TaskModal';
+import { EnvironmentIssuePanel, getTaskEnvironmentIssue } from './EnvironmentIssuePanel';
 import { formatDistanceToNow } from 'date-fns';
 
 interface MissionQueueProps {
@@ -440,6 +441,7 @@ function TaskCard({ task, onDragStart, onClick, onMoveStatus, isDragging, mobile
   const isSubtask = !!task.is_subtask;
   const isAssigned = task.status === 'assigned';
   const dispatchError = task.planning_dispatch_error;
+  const environmentIssue = getTaskEnvironmentIssue(task);
 
   const handleRetryDispatch = async (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -515,7 +517,15 @@ function TaskCard({ task, onDragStart, onClick, onMoveStatus, isDragging, mobile
           </div>
         )}
 
-        {isAssigned && dispatchError && (
+        {environmentIssue && (
+          <EnvironmentIssuePanel
+            task={task}
+            compact
+            className={portraitMode ? 'mb-3' : 'mb-2'}
+          />
+        )}
+
+        {isAssigned && dispatchError && !environmentIssue && (
           <div className={`${portraitMode ? 'mb-3 p-3' : 'mb-2 p-2.5'} bg-red-500/10 rounded-md border border-red-500/30`}>
             <div className="flex items-start gap-2">
               <AlertTriangle className="w-3.5 h-3.5 text-red-300 mt-0.5 flex-shrink-0" />
@@ -542,7 +552,7 @@ function TaskCard({ task, onDragStart, onClick, onMoveStatus, isDragging, mobile
           </div>
         )}
 
-        {isAssigned && !dispatchError && (
+        {isAssigned && !dispatchError && !environmentIssue && (
           <AssignedStatusBadge
             task={task}
             portraitMode={portraitMode}
@@ -559,7 +569,7 @@ function TaskCard({ task, onDragStart, onClick, onMoveStatus, isDragging, mobile
           </div>
         )}
 
-        {['testing', 'verification'].includes(task.status) && dispatchError && (
+        {['testing', 'verification'].includes(task.status) && dispatchError && !environmentIssue && (
           <div className={`flex items-start gap-2 ${portraitMode ? 'mb-3 py-2 px-3' : 'mb-2 py-1.5 px-2.5'} bg-red-500/10 rounded-md border border-red-500/30`}>
             <div className="w-2 h-2 bg-red-400 rounded-full mt-1 flex-shrink-0" />
             <span className="text-xs text-red-300">{dispatchError}</span>

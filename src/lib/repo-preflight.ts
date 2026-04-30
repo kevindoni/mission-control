@@ -60,7 +60,7 @@ function parseHeadBranches(lsRemoteOutput: string): string[] {
 function authHintForGitError(errorText: string): string {
   const lower = errorText.toLowerCase();
   if (lower.includes('could not resolve host')) {
-    return 'Mission Control could not reach GitHub from the server process. Check network/DNS and retry.';
+    return 'Mission Control could not reach the repository host from the server process. Check network/DNS and retry.';
   }
   if (
     lower.includes('repository not found') ||
@@ -68,7 +68,7 @@ function authHintForGitError(errorText: string): string {
     lower.includes('could not read username') ||
     lower.includes('permission denied')
   ) {
-    return 'Authenticate git for the same user running Mission Control, for example with gh auth login, an SSH remote with a loaded key, or a Git credential helper token.';
+    return 'Authenticate git for the same user running Mission Control, using credentials that can access this repository.';
   }
   return 'Verify the repo URL and that the Mission Control server user can run git ls-remote against it.';
 }

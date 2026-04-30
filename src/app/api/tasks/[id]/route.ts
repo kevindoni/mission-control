@@ -10,6 +10,7 @@ import { syncGatewayAgentsToCatalog } from '@/lib/agent-catalog-sync';
 import { triggerWorkspaceMerge } from '@/lib/workspace-isolation';
 import { cancelCodexRunsForTask } from '@/lib/codex/dispatch';
 import { UpdateTaskSchema } from '@/lib/validation';
+import { classifyEnvironmentIssueFromTexts } from '@/lib/environment-issues';
 import type { Task, UpdateTaskRequest, Agent, TaskDeliverable } from '@/lib/types';
 
 export const dynamic = 'force-dynamic';
@@ -44,10 +45,18 @@ export async function GET(
 ) {
   try {
     const { id } = await params;
-    const task = queryOne<Task>(
+    const task = queryOne<Task & { assigned_agent_name?: string; assigned_agent_emoji?: string; latest_activity_context?: string | null }>(
       `SELECT t.*,
         aa.name as assigned_agent_name,
-        aa.avatar_emoji as assigned_agent_emoji
+        aa.avatar_emoji as assigned_agent_emoji,
+        (
+          SELECT ta.message || ' ' || COALESCE(ta.metadata, '')
+          FROM task_activities ta
+          WHERE ta.task_id = t.id
+            AND ta.activity_type IN ('environment_blocked', 'status_changed')
+          ORDER BY ta.created_at DESC
+          LIMIT 1
+        ) as latest_activity_context
        FROM tasks t
        LEFT JOIN agents aa ON t.assigned_agent_id = aa.id
        WHERE t.id = ?`,
@@ -58,7 +67,25 @@ export async function GET(
       return NextResponse.json({ error: 'Task not found' }, { status: 404 });
     }
 
-    return NextResponse.json(task);
+    const environmentIssue = classifyEnvironmentIssueFromTexts([
+      task.status_reason,
+      task.planning_dispatch_error,
+      task.latest_activity_context,
+    ]);
+    const { latest_activity_context: _latestActivityContext, ...taskFields } = task;
+
+    return NextResponse.json({
+      ...taskFields,
+      status_reason: task.status_reason || (environmentIssue ? `Environment action required: ${environmentIssue.userMessage}` : task.status_reason),
+      planning_dispatch_error: task.planning_dispatch_error || (environmentIssue ? `Environment blocked (${environmentIssue.code})` : task.planning_dispatch_error),
+      assigned_agent: task.assigned_agent_id
+        ? {
+            id: task.assigned_agent_id,
+            name: task.assigned_agent_name,
+            avatar_emoji: task.assigned_agent_emoji,
+          }
+        : undefined,
+    });
   } catch (error) {
     console.error('Failed to fetch task:', error);
     return NextResponse.json({ error: 'Failed to fetch task' }, { status: 500 });
