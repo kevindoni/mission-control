@@ -1728,6 +1728,18 @@ const migrations: Migration[] = [
 
       console.log('[Migration 033] product_mcp_servers table created');
     }
+  },
+  {
+    id: '034',
+    name: 'add_browser_qa_columns',
+    up: (db) => {
+      console.log('[Migration 034] Adding browser QA columns...');
+
+      db.exec(`ALTER TABLE products ADD COLUMN browser_test_enabled INTEGER DEFAULT 1`);
+      db.exec(`ALTER TABLE tasks ADD COLUMN browser_test_url TEXT`);
+
+      console.log('[Migration 034] browser_test_enabled (products) and browser_test_url (tasks) added');
+    }
   }
 ];
 

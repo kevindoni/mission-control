@@ -3,6 +3,7 @@ import { getTaskWorkflow } from '@/lib/workflow-engine';
 import { formatMailForDispatch } from '@/lib/mailbox';
 import { getPendingNotesForDispatch } from '@/lib/task-notes';
 import { getMatchedSkills, formatSkillsForDispatch } from '@/lib/skills';
+import { buildBrowserTestContext } from '@/lib/browser-test-context';
 import type {
   Agent,
   Idea,
@@ -690,6 +691,9 @@ export function buildTaskDispatchContext(input: DispatchContextInput): DispatchC
   addSection(sections, 'images', 'Reference Images', formatImagesSection(task, missionControlUrl), SECTION_MAX_CHARS);
   addSection(sections, 'repo', 'Repository and PR Workflow', formatRepoSection(task, missionControlUrl, isBuilder), SECTION_MAX_CHARS);
   addSection(sections, 'workspace', 'Workspace and Deliverable Location', formatWorkspaceSection(input, isBuilder), SECTION_MAX_CHARS);
+  if (isTester) {
+    addSection(sections, 'browser_test', 'Browser Testing', buildBrowserTestContext(task as Task & { planning_spec?: string; workspace_port?: number; browser_test_url?: string }), SECTION_MAX_CHARS);
+  }
   addSection(sections, 'completion', 'Completion Contract', formatCompletionSection(input, isBuilder, Boolean(isTester), Boolean(isVerifier), nextStatus), SECTION_MAX_CHARS);
   addSection(sections, 'support', 'Support', 'If you need help or clarification, ask the orchestrator through Mission Control.');
 
