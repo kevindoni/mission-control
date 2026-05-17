@@ -11,7 +11,8 @@ import { getAgentRuntimeSettings } from '@/lib/runtime-settings';
 import { getCodexCliStatus } from '@/lib/codex/status';
 import { cancelCodexRunsForTask, startCodexTaskRun } from '@/lib/codex/dispatch';
 import { buildTaskDispatchContext } from '@/lib/task-dispatch-context';
-import type { Task, Agent, Product, OpenClawSession } from '@/lib/types';
+import { formatMCPToolsForDispatch } from '@/lib/mcp/proxy';
+import type { Task, Agent, Product, OpenClawSession, WorkflowStage, TaskImage } from '@/lib/types';
 
 export const dynamic = 'force-dynamic';
 interface RouteParams {
@@ -182,7 +183,16 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       workspaceBranchName,
       workspacePort,
     });
-    const finalMessage = dispatchContext.message;
+    let finalMessage = dispatchContext.message;
+
+    if (task.product_id) {
+      try {
+        const mcpSection = formatMCPToolsForDispatch(task.product_id);
+        if (mcpSection) finalMessage += mcpSection;
+      } catch {
+        // MCP injection is best-effort — never block dispatch
+      }
+    }
 
     const runtimeSettings = getAgentRuntimeSettings();
 
