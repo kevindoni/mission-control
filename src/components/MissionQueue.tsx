@@ -614,6 +614,11 @@ function TaskCard({ task, onDragStart, onClick, onMoveStatus, isDragging, mobile
           <div className="flex items-center gap-1.5">
             <div className={`w-1.5 h-1.5 rounded-full ${priorityDots[task.priority]}`} />
             <span className={`text-xs capitalize ${priorityStyles[task.priority]}`}>{task.priority}</span>
+            {task.jira_issue_key && (
+              <span className="text-[10px] font-medium text-blue-400" title={`Linked: ${task.jira_issue_key}`}>
+                JIRA
+              </span>
+            )}
           </div>
           <span className="text-[10px] text-mc-text-secondary/60">{formatDistanceToNow(new Date(task.created_at), { addSuffix: true })}</span>
         </div>

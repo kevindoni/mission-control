@@ -6,6 +6,7 @@ import { CreateTaskSchema } from '@/lib/validation';
 import { populateTaskRolesFromAgents } from '@/lib/workflow-engine';
 import { dispatchTaskFromServer } from '@/lib/server-dispatch';
 import { classifyEnvironmentIssueFromTexts } from '@/lib/environment-issues';
+import { syncTaskToJira } from '@/lib/jira/sync';
 import type { Task, CreateTaskRequest, Agent } from '@/lib/types';
 
 // GET /api/tasks - List all tasks with optional filters
@@ -32,10 +33,13 @@ export async function GET(request: NextRequest) {
             AND ta.activity_type IN ('environment_blocked', 'status_changed')
           ORDER BY ta.created_at DESC
           LIMIT 1
-        ) as latest_activity_context
+        ) as latest_activity_context,
+        js.jira_issue_key,
+        js.jira_issue_url
       FROM tasks t
       LEFT JOIN agents aa ON t.assigned_agent_id = aa.id
       LEFT JOIN agents ca ON t.created_by_agent_id = ca.id
+      LEFT JOIN jira_sync js ON js.task_id = t.id
       WHERE 1=1
     `;
     const params: unknown[] = [];
@@ -220,6 +224,11 @@ export async function POST(request: NextRequest) {
         payload: transformedTask,
       });
     }
+
+    // Fire-and-forget Jira sync (same pattern as auto-dispatch)
+    syncTaskToJira(id).catch(err => {
+      console.error('[Jira Sync] Failed to sync new task:', err);
+    });
 
     return NextResponse.json(transformedTask, { status: 201 });
   } catch (error) {

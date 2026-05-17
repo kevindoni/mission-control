@@ -11,6 +11,7 @@ import { triggerWorkspaceMerge } from '@/lib/workspace-isolation';
 import { cancelCodexRunsForTask } from '@/lib/codex/dispatch';
 import { UpdateTaskSchema } from '@/lib/validation';
 import { classifyEnvironmentIssueFromTexts } from '@/lib/environment-issues';
+import { syncTaskToJira } from '@/lib/jira/sync';
 import type { Task, UpdateTaskRequest, Agent, TaskDeliverable } from '@/lib/types';
 
 export const dynamic = 'force-dynamic';
@@ -58,9 +59,12 @@ export async function GET(
             AND ta.activity_type IN ('environment_blocked', 'status_changed')
           ORDER BY ta.created_at DESC
           LIMIT 1
-        ) as latest_activity_context
+        ) as latest_activity_context,
+        js.jira_issue_key,
+        js.jira_issue_url
        FROM tasks t
        LEFT JOIN agents aa ON t.assigned_agent_id = aa.id
+       LEFT JOIN jira_sync js ON js.task_id = t.id
        WHERE t.id = ?`,
       [id]
     );
@@ -520,6 +524,11 @@ export async function PATCH(
         );
       }
     }
+
+    // Fire-and-forget Jira sync (same pattern as auto-dispatch)
+    syncTaskToJira(id).catch(err => {
+      console.error('[Jira Sync] Failed to sync updated task:', err);
+    });
 
     return NextResponse.json(task);
   } catch (error) {

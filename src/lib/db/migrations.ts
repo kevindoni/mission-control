@@ -1794,6 +1794,32 @@ const migrations: Migration[] = [
 
       console.log('[Migration 036] codebase_snapshots table created');
     }
+  },
+  {
+    id: '037',
+    name: 'add_jira_sync',
+    up: (db) => {
+      console.log('[Migration 037] Adding jira_sync table...');
+
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS jira_sync (
+          id TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id) ON DELETE CASCADE,
+          jira_issue_id TEXT NOT NULL,
+          jira_issue_key TEXT NOT NULL,
+          jira_issue_url TEXT NOT NULL,
+          sync_enabled INTEGER DEFAULT 1,
+          last_synced_at TEXT,
+          last_sync_direction TEXT,
+          created_at TEXT DEFAULT (datetime('now'))
+        )
+      `);
+      db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_jira_sync_task ON jira_sync(task_id)`);
+      db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_jira_sync_jira_id ON jira_sync(jira_issue_id)`);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_jira_sync_key ON jira_sync(jira_issue_key)`);
+
+      console.log('[Migration 037] Created jira_sync table with indexes');
+    }
   }
 ];
 

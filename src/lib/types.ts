@@ -97,6 +97,8 @@ export interface Task {
   browser_test_url?: string;
   review_fix_count?: number;
   review_fix_max?: number;
+  jira_issue_key?: string;
+  jira_issue_url?: string;
   created_at: string;
   updated_at: string;
   // Joined fields

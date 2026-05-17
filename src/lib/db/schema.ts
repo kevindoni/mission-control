@@ -800,6 +800,19 @@ CREATE TABLE IF NOT EXISTS codebase_snapshots (
   UNIQUE(product_id, commit_sha)
 );
 
+-- Jira Cloud sync mapping
+CREATE TABLE IF NOT EXISTS jira_sync (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id) ON DELETE CASCADE,
+  jira_issue_id TEXT NOT NULL,
+  jira_issue_key TEXT NOT NULL,
+  jira_issue_url TEXT NOT NULL,
+  sync_enabled INTEGER DEFAULT 1,
+  last_synced_at TEXT,
+  last_sync_direction TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+
 -- Indexes for performance
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_assigned ON tasks(assigned_agent_id);
@@ -866,4 +879,7 @@ CREATE INDEX IF NOT EXISTS idx_product_skills_confidence ON product_skills(confi
 CREATE INDEX IF NOT EXISTS idx_skill_reports_skill ON skill_reports(skill_id);
 CREATE INDEX IF NOT EXISTS idx_codex_sessions_task ON codex_sessions(task_id, status);
 CREATE INDEX IF NOT EXISTS idx_codex_sessions_agent ON codex_sessions(agent_id, status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_jira_sync_task ON jira_sync(task_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_jira_sync_jira_id ON jira_sync(jira_issue_id);
+CREATE INDEX IF NOT EXISTS idx_jira_sync_key ON jira_sync(jira_issue_key);
 `;
