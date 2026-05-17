@@ -1671,6 +1671,37 @@ const migrations: Migration[] = [
       db.exec('CREATE INDEX IF NOT EXISTS idx_codex_sessions_task ON codex_sessions(task_id, status)');
       db.exec('CREATE INDEX IF NOT EXISTS idx_codex_sessions_agent ON codex_sessions(agent_id, status)');
     }
+  },
+  {
+    id: '032',
+    name: 'add_session_insights',
+    up: (db) => {
+      console.log('[Migration 032] Adding task_insights table...');
+
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS task_insights (
+          id TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          product_id TEXT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+          duration_seconds INTEGER,
+          time_to_first_commit INTEGER,
+          build_attempts INTEGER,
+          test_pass_rate REAL,
+          stall_count INTEGER,
+          error_count INTEGER,
+          bottleneck_summary TEXT,
+          improved_prompt TEXT,
+          timeline_data TEXT,
+          insights_json TEXT,
+          generated_at TEXT DEFAULT (datetime('now')),
+          UNIQUE(task_id)
+        )
+      `);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_task_insights_product ON task_insights(product_id)`);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_task_insights_task ON task_insights(task_id)`);
+
+      console.log('[Migration 032] task_insights table created');
+    }
   }
 ];
 
