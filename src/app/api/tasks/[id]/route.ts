@@ -36,6 +36,8 @@ function clearTaskReferences(taskId: string): void {
   run('UPDATE conversations SET task_id = NULL WHERE task_id = ?', [taskId]);
   run('UPDATE knowledge_entries SET task_id = NULL WHERE task_id = ?', [taskId]);
   run('UPDATE product_skills SET created_by_task_id = NULL WHERE created_by_task_id = ?', [taskId]);
+  run('UPDATE ideas SET task_id = NULL WHERE task_id = ?', [taskId]);
+  run('UPDATE content_inventory SET task_id = NULL WHERE task_id = ?', [taskId]);
 }
 
 // GET /api/tasks/[id] - Get a single task
