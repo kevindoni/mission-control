@@ -500,6 +500,7 @@ export interface Product {
   batch_review_threshold?: number;
   browser_test_enabled?: number;
   auto_fix_pr_reviews?: number;
+  exploration_depth?: 'shallow' | 'standard' | 'deep';
   created_at: string;
   updated_at: string;
 }

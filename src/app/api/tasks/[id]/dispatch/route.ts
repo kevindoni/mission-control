@@ -12,6 +12,7 @@ import { getCodexCliStatus } from '@/lib/codex/status';
 import { cancelCodexRunsForTask, startCodexTaskRun } from '@/lib/codex/dispatch';
 import { buildTaskDispatchContext } from '@/lib/task-dispatch-context';
 import { formatMCPToolsForDispatch } from '@/lib/mcp/proxy';
+import { getCachedCodebaseContext, type ExplorationDepth } from '@/lib/codebase-explorer';
 import type { Task, Agent, Product, OpenClawSession, WorkflowStage, TaskImage } from '@/lib/types';
 
 export const dynamic = 'force-dynamic';
@@ -200,6 +201,27 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
         if (mcpSection) finalMessage += mcpSection;
       } catch {
         // MCP injection is best-effort — never block dispatch
+      }
+    }
+
+    if (task.product_id && isBuilderDispatch) {
+      try {
+        const product = queryOne<Product>('SELECT * FROM products WHERE id = ?', [task.product_id]);
+        if (product?.repo_url) {
+          const depth = (product.exploration_depth as ExplorationDepth) || 'standard';
+          const context = getCachedCodebaseContext(
+            task.product_id,
+            product.repo_url,
+            depth,
+            task.title,
+            task.description || undefined,
+          );
+          if (context) {
+            finalMessage += `\n---\n${context}\n`;
+          }
+        }
+      } catch {
+        // Codebase context injection is best-effort — never block dispatch
       }
     }
 
