@@ -3,7 +3,7 @@ import { createNote, getTaskNotes, getActiveSessionForTask, markNotesDelivered }
 import { getOpenClawClient } from '@/lib/openclaw/client';
 import { getMissionControlUrl } from '@/lib/config';
 import { attachChatListener, expectReply } from '@/lib/chat-listener';
-import { queryOne } from '@/lib/db';
+import { queryOne, run } from '@/lib/db';
 import { broadcast } from '@/lib/events';
 import type { Task } from '@/lib/types';
 
@@ -92,10 +92,20 @@ export async function POST(
       }
     }
 
-    // Fall back to dispatch only if:
-    // 1. Message wasn't delivered via chat.send
-    // 2. Task is in a state where dispatch makes sense (not done, not already in_progress)
-    if (!delivered && ['assigned', 'inbox', 'testing', 'review', 'verification'].includes(task.status)) {
+    // Fall back to dispatch if the message wasn't delivered via chat.send.
+    // Skip dispatch for: convoy_active (parent has no direct agent), pending_dispatch
+    // (a dispatch is already in flight), and done (work finished).
+    const dispatchableStatuses = ['planning', 'inbox', 'assigned', 'in_progress', 'testing', 'review', 'verification', 'review_fix'];
+    if (!delivered && dispatchableStatuses.includes(task.status)) {
+      // Planning-state tasks have no agent yet — transition to assigned so dispatch
+      // can pick a builder and move the task to in_progress like any other build.
+      if (task.status === 'planning') {
+        run(
+          `UPDATE tasks SET status = 'assigned', planning_complete = 1, planning_dispatch_error = NULL, status_reason = NULL, updated_at = datetime('now') WHERE id = ?`,
+          [taskId]
+        );
+      }
+
       try {
         const missionControlUrl = getMissionControlUrl();
         const headers: Record<string, string> = { 'Content-Type': 'application/json' };
