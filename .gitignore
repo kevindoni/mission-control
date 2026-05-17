@@ -6,6 +6,8 @@
 
 # testing
 /coverage
+.playwright-mcp/
+.codex-runs/
 
 # next.js
 /.next/

@@ -73,6 +73,9 @@ export interface Task {
   planning_complete?: number;
   planning_dispatch_error?: string;
   planning_session_key?: string;
+  planning_messages?: string;
+  planning_spec?: string;
+  planning_agents?: string;
   images?: string; // JSON array of TaskImage objects
   convoy_id?: string;
   is_subtask?: number;
@@ -230,6 +233,25 @@ export interface OpenClawSession {
   status: string;
   session_type: 'persistent' | 'subagent';
   task_id?: string;
+  ended_at?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CodexSession {
+  id: string;
+  agent_id: string;
+  task_id: string;
+  codex_thread_id?: string;
+  pid?: number;
+  status: 'running' | 'completed' | 'failed' | 'cancelled';
+  command: string;
+  cwd: string;
+  log_path?: string;
+  exit_code?: number;
+  signal?: string;
+  error?: string;
+  started_at: string;
   ended_at?: string;
   created_at: string;
   updated_at: string;

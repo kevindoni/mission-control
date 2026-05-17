@@ -11,6 +11,7 @@ import {
   Settings, Save, RotateCcw, Home, FolderOpen, Link as LinkIcon,
   HardDrive, Download, Upload, Trash2, RotateCw, ChevronDown, ChevronRight,
   AlertTriangle, Check, Loader2, Cloud, CloudOff, Shield,
+  Bot, Terminal, Copy, CheckCircle2,
 } from 'lucide-react';
 import { getConfig, updateConfig, resetConfig, type MissionControlConfig } from '@/lib/config';
 
@@ -31,6 +32,37 @@ interface BackupListResponse {
   backups: BackupMetadata[];
   total: number;
   s3: { configured: boolean; endpoint?: string; bucket?: string };
+}
+
+type RuntimeProvider = 'openclaw' | 'codex';
+
+interface RuntimeSettings {
+  provider: RuntimeProvider;
+  codexCloudEnvironmentId: string;
+  codexDefaultBranch: string;
+  envOverrides: {
+    provider: boolean;
+    codexCloudEnvironmentId: boolean;
+    codexDefaultBranch: boolean;
+  };
+}
+
+interface CodexStatus {
+  installed: boolean;
+  authenticated: boolean;
+  ready: boolean;
+  command: string;
+  version?: string;
+  authMethod?: string;
+  error?: string;
+  loginCommand: string;
+}
+
+interface OpenClawStatus {
+  connected: boolean;
+  sessions_count?: number;
+  gateway_url?: string;
+  error?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -66,6 +98,11 @@ export default function SettingsPage() {
   const [isSaving, setIsSaving] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [runtimeSettings, setRuntimeSettings] = useState<RuntimeSettings | null>(null);
+  const [codexStatus, setCodexStatus] = useState<CodexStatus | null>(null);
+  const [openClawStatus, setOpenClawStatus] = useState<OpenClawStatus | null>(null);
+  const [runtimeStatusLoading, setRuntimeStatusLoading] = useState(false);
+  const [copiedCodexCommand, setCopiedCodexCommand] = useState(false);
 
   // Backup state
   const [backups, setBackups] = useState<BackupMetadata[]>([]);
@@ -82,7 +119,39 @@ export default function SettingsPage() {
 
   useEffect(() => {
     setConfig(getConfig());
+    loadRuntimeSettings();
+    refreshRuntimeStatus();
   }, []);
+
+  const loadRuntimeSettings = async () => {
+    try {
+      const res = await fetch('/api/runtime/settings');
+      if (!res.ok) throw new Error('Failed to load runtime settings');
+      setRuntimeSettings(await res.json());
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to load runtime settings');
+    }
+  };
+
+  const refreshRuntimeStatus = async () => {
+    setRuntimeStatusLoading(true);
+    try {
+      const [openClawRes, codexRes] = await Promise.all([
+        fetch('/api/openclaw/status'),
+        fetch('/api/runtime/codex/status'),
+      ]);
+
+      if (openClawRes.ok) {
+        setOpenClawStatus(await openClawRes.json());
+      }
+
+      if (codexRes.ok) {
+        setCodexStatus(await codexRes.json());
+      }
+    } finally {
+      setRuntimeStatusLoading(false);
+    }
+  };
 
   // Fetch backups on mount
   const fetchBackups = useCallback(async () => {
@@ -119,6 +188,26 @@ export default function SettingsPage() {
 
     try {
       updateConfig(config);
+
+      if (runtimeSettings) {
+        const res = await fetch('/api/runtime/settings', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            provider: runtimeSettings.provider,
+            codexCloudEnvironmentId: runtimeSettings.codexCloudEnvironmentId,
+            codexDefaultBranch: runtimeSettings.codexDefaultBranch,
+          }),
+        });
+
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({ error: 'Failed to save runtime settings' }));
+          throw new Error(body.error || 'Failed to save runtime settings');
+        }
+
+        setRuntimeSettings(await res.json());
+      }
+
       setSaveSuccess(true);
       setTimeout(() => setSaveSuccess(false), 3000);
     } catch (err) {
@@ -128,12 +217,31 @@ export default function SettingsPage() {
     }
   };
 
-  const handleReset = () => {
+  const handleReset = async () => {
     if (confirm('Reset all settings to defaults? This cannot be undone.')) {
-      resetConfig();
-      setConfig(getConfig());
-      setSaveSuccess(true);
-      setTimeout(() => setSaveSuccess(false), 3000);
+      try {
+        resetConfig();
+        setConfig(getConfig());
+
+        const res = await fetch('/api/runtime/settings', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            provider: 'openclaw',
+            codexCloudEnvironmentId: '',
+            codexDefaultBranch: '',
+          }),
+        });
+
+        if (res.ok) {
+          setRuntimeSettings(await res.json());
+        }
+
+        setSaveSuccess(true);
+        setTimeout(() => setSaveSuccess(false), 3000);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Failed to reset settings');
+      }
     }
   };
 
@@ -141,6 +249,32 @@ export default function SettingsPage() {
     if (!config) return;
     setConfig({ ...config, [field]: value });
   };
+
+  const handleRuntimeChange = (updates: Partial<RuntimeSettings>) => {
+    setRuntimeSettings((current) => current ? { ...current, ...updates } : current);
+  };
+
+  const copyCodexLoginCommand = async () => {
+    const command = codexStatus?.loginCommand || 'codex login --device-auth';
+    try {
+      await navigator.clipboard.writeText(command);
+      setCopiedCodexCommand(true);
+      setTimeout(() => setCopiedCodexCommand(false), 2000);
+    } catch {
+      setError(`Run this command in your terminal: ${command}`);
+    }
+  };
+
+  const statusBadge = (ready: boolean | undefined, label: string) => (
+    <span className={`inline-flex items-center gap-1 px-2 py-1 rounded text-xs border ${
+      ready
+        ? 'border-green-500/40 bg-green-500/10 text-green-400'
+        : 'border-amber-500/40 bg-amber-500/10 text-amber-300'
+    }`}>
+      {ready ? <CheckCircle2 className="w-3 h-3" /> : <AlertTriangle className="w-3 h-3" />}
+      {label}
+    </span>
+  );
 
   // ---------------------------------------------------------------------------
   // Backup handlers
@@ -369,6 +503,151 @@ export default function SettingsPage() {
               </p>
             </div>
           </div>
+        </section>
+
+        {/* Agent Runtime */}
+        <section className="mb-8 p-6 bg-mc-bg-secondary border border-mc-border rounded-lg">
+          <div className="flex items-center justify-between gap-3 mb-4">
+            <div className="flex items-center gap-2">
+              <Bot className="w-5 h-5 text-mc-accent" />
+              <h2 className="text-xl font-semibold text-mc-text">Agent Runtime</h2>
+            </div>
+            <button
+              onClick={refreshRuntimeStatus}
+              disabled={runtimeStatusLoading}
+              className="px-3 py-2 border border-mc-border rounded hover:bg-mc-bg-tertiary text-mc-text-secondary flex items-center gap-2 disabled:opacity-50"
+            >
+              <RotateCw className={`w-4 h-4 ${runtimeStatusLoading ? 'animate-spin' : ''}`} />
+              Refresh
+            </button>
+          </div>
+          <p className="text-sm text-mc-text-secondary mb-4">
+            Choose the runtime Mission Control should prepare for agent work.
+          </p>
+
+          {runtimeSettings ? (
+            <div className="space-y-4">
+              <div className="grid md:grid-cols-2 gap-3">
+                <label className={`p-4 bg-mc-bg border rounded cursor-pointer ${
+                  runtimeSettings.provider === 'openclaw' ? 'border-mc-accent' : 'border-mc-border'
+                }`}>
+                  <input
+                    type="radio"
+                    name="agent-runtime-provider"
+                    value="openclaw"
+                    checked={runtimeSettings.provider === 'openclaw'}
+                    onChange={() => handleRuntimeChange({ provider: 'openclaw' })}
+                    disabled={runtimeSettings.envOverrides.provider}
+                    className="sr-only"
+                  />
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2 text-sm font-semibold text-mc-text">
+                        <Terminal className="w-4 h-4 text-mc-accent" />
+                        OpenClaw Gateway
+                      </div>
+                      <div className="text-xs text-mc-text-secondary mt-2">
+                        {openClawStatus?.gateway_url || 'ws://127.0.0.1:18789'}
+                      </div>
+                    </div>
+                    {statusBadge(openClawStatus?.connected, openClawStatus?.connected ? 'Ready' : 'Check')}
+                  </div>
+                  <div className="mt-3 text-xs text-mc-text-secondary">
+                    Sessions: {openClawStatus?.sessions_count ?? 0}
+                    {openClawStatus?.error ? ` - ${openClawStatus.error}` : ''}
+                  </div>
+                </label>
+
+                <label className={`p-4 bg-mc-bg border rounded cursor-pointer ${
+                  runtimeSettings.provider === 'codex' ? 'border-mc-accent' : 'border-mc-border'
+                }`}>
+                  <input
+                    type="radio"
+                    name="agent-runtime-provider"
+                    value="codex"
+                    checked={runtimeSettings.provider === 'codex'}
+                    onChange={() => handleRuntimeChange({ provider: 'codex' })}
+                    disabled={runtimeSettings.envOverrides.provider}
+                    className="sr-only"
+                  />
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2 text-sm font-semibold text-mc-text">
+                        <Terminal className="w-4 h-4 text-mc-accent" />
+                        Codex CLI
+                      </div>
+                      <div className="text-xs text-mc-text-secondary mt-2">
+                        {codexStatus?.version || codexStatus?.command || 'codex'}
+                      </div>
+                    </div>
+                    {statusBadge(codexStatus?.ready, codexStatus?.ready ? 'Ready' : 'Login')}
+                  </div>
+                  <div className="mt-3 text-xs text-mc-text-secondary">
+                    Auth: {codexStatus?.authenticated ? codexStatus.authMethod || 'Logged in' : codexStatus?.error || 'Not checked'}
+                  </div>
+                </label>
+              </div>
+
+              <div className="grid md:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-sm font-medium text-mc-text mb-2">
+                    Codex Cloud Environment ID
+                  </label>
+                  <input
+                    type="text"
+                    value={runtimeSettings.codexCloudEnvironmentId}
+                    onChange={(e) => handleRuntimeChange({ codexCloudEnvironmentId: e.target.value })}
+                    placeholder="env_..."
+                    disabled={runtimeSettings.envOverrides.codexCloudEnvironmentId}
+                    className="w-full px-4 py-2 bg-mc-bg border border-mc-border rounded text-mc-text focus:border-mc-accent focus:outline-none disabled:opacity-60"
+                  />
+                  <p className="text-xs text-mc-text-secondary mt-1">
+                    Used by Codex Cloud task submission once Codex dispatch is enabled.
+                  </p>
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium text-mc-text mb-2">
+                    Codex Default Branch
+                  </label>
+                  <input
+                    type="text"
+                    value={runtimeSettings.codexDefaultBranch}
+                    onChange={(e) => handleRuntimeChange({ codexDefaultBranch: e.target.value })}
+                    placeholder="main"
+                    disabled={runtimeSettings.envOverrides.codexDefaultBranch}
+                    className="w-full px-4 py-2 bg-mc-bg border border-mc-border rounded text-mc-text focus:border-mc-accent focus:outline-none disabled:opacity-60"
+                  />
+                  <p className="text-xs text-mc-text-secondary mt-1">
+                    Leave blank to let Codex use the current branch.
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2 pt-1">
+                <button
+                  onClick={copyCodexLoginCommand}
+                  className="px-3 py-2 border border-mc-border rounded hover:bg-mc-bg-tertiary text-mc-text-secondary flex items-center gap-2"
+                >
+                  <Copy className="w-4 h-4" />
+                  {copiedCodexCommand ? 'Copied' : 'Copy Codex Login Command'}
+                </button>
+                <span className="text-xs text-mc-text-secondary">
+                  {codexStatus?.loginCommand || 'codex login --device-auth'}
+                </span>
+              </div>
+
+              {runtimeSettings.envOverrides.provider && (
+                <div className="text-xs text-amber-300">
+                  Runtime provider is currently controlled by AGENT_RUNTIME_PROVIDER.
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="p-4 bg-mc-bg border border-mc-border rounded text-sm text-mc-text-secondary">
+              Loading runtime settings...
+            </div>
+          )}
         </section>
 
         {/* Kanban UX */}
@@ -679,6 +958,11 @@ export default function SettingsPage() {
             <li><code>PROJECTS_PATH</code> - Projects directory</li>
             <li><code>OPENCLAW_GATEWAY_URL</code> - Gateway WebSocket URL</li>
             <li><code>OPENCLAW_GATEWAY_TOKEN</code> - Gateway auth token</li>
+            <li><code>AGENT_RUNTIME_PROVIDER</code> - Runtime provider override (<code>openclaw</code> or <code>codex</code>)</li>
+            <li><code>CODEX_CLI_PATH</code> - Codex CLI executable path</li>
+            <li><code>CODEX_DISPATCH_SANDBOX</code> - Codex CLI dispatch sandbox mode</li>
+            <li><code>CODEX_CLOUD_ENV_ID</code> - Codex Cloud environment ID</li>
+            <li><code>CODEX_DEFAULT_BRANCH</code> - Default branch for Codex Cloud runs</li>
             <li><code>S3_ENDPOINT</code>, <code>S3_BUCKET</code>, <code>S3_ACCESS_KEY</code>, <code>S3_SECRET_KEY</code> - S3 backup storage</li>
           </ul>
           <p className="text-xs text-blue-400 mt-3">

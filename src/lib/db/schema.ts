@@ -198,6 +198,26 @@ CREATE TABLE IF NOT EXISTS openclaw_sessions (
   updated_at TEXT DEFAULT (datetime('now'))
 );
 
+-- Codex runtime session mapping
+CREATE TABLE IF NOT EXISTS codex_sessions (
+  id TEXT PRIMARY KEY,
+  agent_id TEXT REFERENCES agents(id),
+  task_id TEXT REFERENCES tasks(id) ON DELETE CASCADE,
+  codex_thread_id TEXT,
+  pid INTEGER,
+  status TEXT NOT NULL DEFAULT 'running' CHECK (status IN ('running', 'completed', 'failed', 'cancelled')),
+  command TEXT NOT NULL,
+  cwd TEXT NOT NULL,
+  log_path TEXT,
+  exit_code INTEGER,
+  signal TEXT,
+  error TEXT,
+  started_at TEXT DEFAULT (datetime('now')),
+  ended_at TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now'))
+);
+
 -- Workflow templates (per-workspace workflow definitions)
 CREATE TABLE IF NOT EXISTS workflow_templates (
   id TEXT PRIMARY KEY,
@@ -233,6 +253,13 @@ CREATE TABLE IF NOT EXISTS knowledge_entries (
   confidence REAL DEFAULT 0.5,
   created_by_agent_id TEXT REFERENCES agents(id),
   created_at TEXT DEFAULT (datetime('now'))
+);
+
+-- Application settings persisted for server-side workflows
+CREATE TABLE IF NOT EXISTS app_settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at TEXT DEFAULT (datetime('now'))
 );
 
 -- Task activities table (for real-time activity log)
@@ -817,4 +844,6 @@ CREATE INDEX IF NOT EXISTS idx_user_task_reads_user_task ON user_task_reads(user
 CREATE INDEX IF NOT EXISTS idx_product_skills_product ON product_skills(product_id, skill_type, status);
 CREATE INDEX IF NOT EXISTS idx_product_skills_confidence ON product_skills(confidence DESC);
 CREATE INDEX IF NOT EXISTS idx_skill_reports_skill ON skill_reports(skill_id);
+CREATE INDEX IF NOT EXISTS idx_codex_sessions_task ON codex_sessions(task_id, status);
+CREATE INDEX IF NOT EXISTS idx_codex_sessions_agent ON codex_sessions(agent_id, status);
 `;

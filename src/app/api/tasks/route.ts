@@ -5,6 +5,7 @@ import { broadcast } from '@/lib/events';
 import { CreateTaskSchema } from '@/lib/validation';
 import { populateTaskRolesFromAgents } from '@/lib/workflow-engine';
 import { dispatchTaskFromServer } from '@/lib/server-dispatch';
+import { classifyEnvironmentIssueFromTexts } from '@/lib/environment-issues';
 import type { Task, CreateTaskRequest, Agent } from '@/lib/types';
 
 // GET /api/tasks - List all tasks with optional filters
@@ -23,7 +24,15 @@ export async function GET(request: NextRequest) {
         t.*,
         aa.name as assigned_agent_name,
         aa.avatar_emoji as assigned_agent_emoji,
-        ca.name as created_by_agent_name
+        ca.name as created_by_agent_name,
+        (
+          SELECT ta.message || ' ' || COALESCE(ta.metadata, '')
+          FROM task_activities ta
+          WHERE ta.task_id = t.id
+            AND ta.activity_type IN ('environment_blocked', 'status_changed')
+          ORDER BY ta.created_at DESC
+          LIMIT 1
+        ) as latest_activity_context
       FROM tasks t
       LEFT JOIN agents aa ON t.assigned_agent_id = aa.id
       LEFT JOIN agents ca ON t.created_by_agent_id = ca.id
@@ -57,19 +66,30 @@ export async function GET(request: NextRequest) {
 
     sql += ' ORDER BY t.created_at DESC';
 
-    const tasks = queryAll<Task & { assigned_agent_name?: string; assigned_agent_emoji?: string; created_by_agent_name?: string }>(sql, params);
+    const tasks = queryAll<Task & { assigned_agent_name?: string; assigned_agent_emoji?: string; created_by_agent_name?: string; latest_activity_context?: string | null }>(sql, params);
 
     // Transform to include nested agent info
-    const transformedTasks = tasks.map((task) => ({
-      ...task,
-      assigned_agent: task.assigned_agent_id
-        ? {
-            id: task.assigned_agent_id,
-            name: task.assigned_agent_name,
-            avatar_emoji: task.assigned_agent_emoji,
-          }
-        : undefined,
-    }));
+    const transformedTasks = tasks.map((task) => {
+      const environmentIssue = classifyEnvironmentIssueFromTexts([
+        task.status_reason,
+        task.planning_dispatch_error,
+        task.latest_activity_context,
+      ]);
+      const { latest_activity_context: _latestActivityContext, ...taskFields } = task;
+
+      return {
+        ...taskFields,
+        status_reason: task.status_reason || (environmentIssue ? `Environment action required: ${environmentIssue.userMessage}` : task.status_reason),
+        planning_dispatch_error: task.planning_dispatch_error || (environmentIssue ? `Environment blocked (${environmentIssue.code})` : task.planning_dispatch_error),
+        assigned_agent: task.assigned_agent_id
+          ? {
+              id: task.assigned_agent_id,
+              name: task.assigned_agent_name,
+              avatar_emoji: task.assigned_agent_emoji,
+            }
+          : undefined,
+      };
+    });
 
     return NextResponse.json(transformedTasks);
   } catch (error) {

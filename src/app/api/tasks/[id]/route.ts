@@ -8,10 +8,37 @@ import { hasStageEvidence, canUseBoardOverride, auditBoardOverride, taskCanBeDon
 import { updateConvoyProgress, checkConvoyCompletion } from '@/lib/convoy';
 import { syncGatewayAgentsToCatalog } from '@/lib/agent-catalog-sync';
 import { triggerWorkspaceMerge } from '@/lib/workspace-isolation';
+import { cancelCodexRunsForTask } from '@/lib/codex/dispatch';
 import { UpdateTaskSchema } from '@/lib/validation';
+import { classifyEnvironmentIssueFromTexts } from '@/lib/environment-issues';
 import type { Task, UpdateTaskRequest, Agent, TaskDeliverable } from '@/lib/types';
 
 export const dynamic = 'force-dynamic';
+
+function clearTaskReferences(taskId: string): void {
+  cancelCodexRunsForTask(taskId);
+  run('DELETE FROM task_roles WHERE task_id = ?', [taskId]);
+  run('DELETE FROM work_checkpoints WHERE task_id = ?', [taskId]);
+  run('DELETE FROM workspace_ports WHERE task_id = ?', [taskId]);
+  run('DELETE FROM workspace_merges WHERE task_id = ?', [taskId]);
+  run('DELETE FROM planning_questions WHERE task_id = ?', [taskId]);
+  run('DELETE FROM planning_specs WHERE task_id = ?', [taskId]);
+  run('DELETE FROM task_notes WHERE task_id = ?', [taskId]);
+  run('DELETE FROM user_task_reads WHERE task_id = ?', [taskId]);
+  run('DELETE FROM task_activities WHERE task_id = ?', [taskId]);
+  run('DELETE FROM task_deliverables WHERE task_id = ?', [taskId]);
+  run('DELETE FROM openclaw_sessions WHERE task_id = ?', [taskId]);
+  run('DELETE FROM codex_sessions WHERE task_id = ?', [taskId]);
+  run('DELETE FROM events WHERE task_id = ?', [taskId]);
+  run('DELETE FROM skill_reports WHERE task_id = ?', [taskId]);
+  run('UPDATE agent_health SET task_id = NULL WHERE task_id = ?', [taskId]);
+  run('UPDATE cost_events SET task_id = NULL WHERE task_id = ?', [taskId]);
+  run('UPDATE conversations SET task_id = NULL WHERE task_id = ?', [taskId]);
+  run('UPDATE knowledge_entries SET task_id = NULL WHERE task_id = ?', [taskId]);
+  run('UPDATE product_skills SET created_by_task_id = NULL WHERE created_by_task_id = ?', [taskId]);
+  run('UPDATE ideas SET task_id = NULL WHERE task_id = ?', [taskId]);
+  run('UPDATE content_inventory SET task_id = NULL WHERE task_id = ?', [taskId]);
+}
 
 // GET /api/tasks/[id] - Get a single task
 export async function GET(
@@ -20,10 +47,18 @@ export async function GET(
 ) {
   try {
     const { id } = await params;
-    const task = queryOne<Task>(
+    const task = queryOne<Task & { assigned_agent_name?: string; assigned_agent_emoji?: string; latest_activity_context?: string | null }>(
       `SELECT t.*,
         aa.name as assigned_agent_name,
-        aa.avatar_emoji as assigned_agent_emoji
+        aa.avatar_emoji as assigned_agent_emoji,
+        (
+          SELECT ta.message || ' ' || COALESCE(ta.metadata, '')
+          FROM task_activities ta
+          WHERE ta.task_id = t.id
+            AND ta.activity_type IN ('environment_blocked', 'status_changed')
+          ORDER BY ta.created_at DESC
+          LIMIT 1
+        ) as latest_activity_context
        FROM tasks t
        LEFT JOIN agents aa ON t.assigned_agent_id = aa.id
        WHERE t.id = ?`,
@@ -34,7 +69,25 @@ export async function GET(
       return NextResponse.json({ error: 'Task not found' }, { status: 404 });
     }
 
-    return NextResponse.json(task);
+    const environmentIssue = classifyEnvironmentIssueFromTexts([
+      task.status_reason,
+      task.planning_dispatch_error,
+      task.latest_activity_context,
+    ]);
+    const { latest_activity_context: _latestActivityContext, ...taskFields } = task;
+
+    return NextResponse.json({
+      ...taskFields,
+      status_reason: task.status_reason || (environmentIssue ? `Environment action required: ${environmentIssue.userMessage}` : task.status_reason),
+      planning_dispatch_error: task.planning_dispatch_error || (environmentIssue ? `Environment blocked (${environmentIssue.code})` : task.planning_dispatch_error),
+      assigned_agent: task.assigned_agent_id
+        ? {
+            id: task.assigned_agent_id,
+            name: task.assigned_agent_name,
+            avatar_emoji: task.assigned_agent_emoji,
+          }
+        : undefined,
+    });
   } catch (error) {
     console.error('Failed to fetch task:', error);
     return NextResponse.json({ error: 'Failed to fetch task' }, { status: 500 });
@@ -511,9 +564,7 @@ export async function DELETE(
       // Delete sub-tasks first (CASCADE handles convoy_subtasks)
       const subtaskIds = queryAll<{ task_id: string }>('SELECT task_id FROM convoy_subtasks WHERE convoy_id = ?', [convoy.id]);
       for (const { task_id } of subtaskIds) {
-        run('DELETE FROM work_checkpoints WHERE task_id = ?', [task_id]);
-        run('DELETE FROM openclaw_sessions WHERE task_id = ?', [task_id]);
-        run('DELETE FROM events WHERE task_id = ?', [task_id]);
+        clearTaskReferences(task_id);
         run('DELETE FROM tasks WHERE id = ?', [task_id]);
       }
       run('DELETE FROM agent_mailbox WHERE convoy_id = ?', [convoy.id]);
@@ -521,13 +572,7 @@ export async function DELETE(
     }
 
     // Delete or nullify related records first (foreign key constraints)
-    // Note: task_activities and task_deliverables have ON DELETE CASCADE
-    run('DELETE FROM work_checkpoints WHERE task_id = ?', [id]);
-    run('DELETE FROM openclaw_sessions WHERE task_id = ?', [id]);
-    run('DELETE FROM events WHERE task_id = ?', [id]);
-    // Conversations and Knowledge reference tasks - nullify or delete
-    run('UPDATE conversations SET task_id = NULL WHERE task_id = ?', [id]);
-    run('UPDATE knowledge_entries SET task_id = NULL WHERE task_id = ?', [id]);
+    clearTaskReferences(id);
 
     // Now delete the task (cascades to task_activities and task_deliverables)
     run('DELETE FROM tasks WHERE id = ?', [id]);

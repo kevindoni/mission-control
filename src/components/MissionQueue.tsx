@@ -1,13 +1,14 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { Plus, ChevronRight, GripVertical, ArrowRightLeft, AlertTriangle, MessageSquare } from 'lucide-react';
+import { Plus, ChevronRight, GripVertical, ArrowRightLeft, AlertTriangle, MessageSquare, RefreshCw } from 'lucide-react';
 import { useMissionControl } from '@/lib/store';
 import { triggerAutoDispatch, shouldTriggerAutoDispatch } from '@/lib/auto-dispatch';
 import { getConfig } from '@/lib/config';
 import { useUnreadCounts } from '@/hooks/useUnreadCounts';
 import type { Task, TaskStatus } from '@/lib/types';
 import { TaskModal } from './TaskModal';
+import { EnvironmentIssuePanel, getTaskEnvironmentIssue } from './EnvironmentIssuePanel';
 import { formatDistanceToNow } from 'date-fns';
 
 interface MissionQueueProps {
@@ -27,6 +28,27 @@ const COLUMNS: { id: TaskStatus; label: string; color: string }[] = [
   { id: 'verification', label: 'Verification', color: 'border-t-orange-500' },
   { id: 'done', label: 'Done', color: 'border-t-mc-accent-green' },
 ];
+
+interface DispatchRetryResponse {
+  success?: boolean;
+  error?: string;
+  userMessage?: string;
+  task?: Task;
+}
+
+function getDispatchErrorSummary(error: string): string {
+  const cleaned = error
+    .replace(/^Auto-nudge failed:\s*/i, '')
+    .replace(/^Auto-recovery failed:\s*/i, '')
+    .replace(/^Retry dispatch failed:\s*/i, '')
+    .trim();
+
+  if (cleaned.toLowerCase().includes('no active') && cleaned.toLowerCase().includes('session')) {
+    return 'Dispatch did not start a tracked runtime session.';
+  }
+
+  return cleaned || error;
+}
 
 export function MissionQueue({ workspaceId, mobileMode = false, isPortrait = true }: MissionQueueProps) {
   const { tasks, updateTaskStatus, addEvent } = useMissionControl();
@@ -335,27 +357,22 @@ export function MissionQueue({ workspaceId, mobileMode = false, isPortrait = tru
   );
 }
 
-function AssignedStatusBadge({ task, portraitMode }: { task: Task; portraitMode: boolean }) {
-  const [retrying, setRetrying] = useState(false);
+function AssignedStatusBadge({
+  task,
+  portraitMode,
+  retrying,
+  retryError,
+  onRetryDispatch,
+}: {
+  task: Task;
+  portraitMode: boolean;
+  retrying: boolean;
+  retryError: string | null;
+  onRetryDispatch: (e: React.MouseEvent) => void;
+}) {
   const updatedAt = new Date(task.updated_at).getTime();
   const staleMs = Date.now() - updatedAt;
   const isStale = staleMs > 2 * 60 * 1000; // 2 minutes
-
-  const handleRetryDispatch = async (e: React.MouseEvent) => {
-    e.stopPropagation(); // Don't open the task modal
-    setRetrying(true);
-    try {
-      const res = await fetch(`/api/tasks/${task.id}/dispatch`, { method: 'POST' });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        console.error('Retry dispatch failed:', data.error);
-      }
-    } catch (err) {
-      console.error('Retry dispatch error:', err);
-    } finally {
-      setRetrying(false);
-    }
-  };
 
   if (isStale) {
     const staleMinutes = Math.floor(staleMs / 60000);
@@ -366,12 +383,18 @@ function AssignedStatusBadge({ task, portraitMode }: { task: Task; portraitMode:
           <span className="text-xs text-amber-200">Stuck in assigned for {staleMinutes}m</span>
         </div>
         <button
-          onClick={handleRetryDispatch}
+          onClick={onRetryDispatch}
           disabled={retrying}
-          className="text-[11px] px-2 py-1 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 rounded border border-amber-500/30 disabled:opacity-50"
+          className="inline-flex items-center gap-1.5 text-[11px] px-2 py-1 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 rounded border border-amber-500/30 disabled:opacity-50"
         >
-          {retrying ? 'Dispatching...' : '↻ Retry Dispatch'}
+          <RefreshCw className={`w-3 h-3 ${retrying ? 'animate-spin' : ''}`} />
+          {retrying ? 'Dispatching...' : 'Retry Dispatch'}
         </button>
+        {retryError && (
+          <div className="mt-1.5 text-[11px] text-red-300 line-clamp-2" title={retryError}>
+            {retryError}
+          </div>
+        )}
       </div>
     );
   }
@@ -396,6 +419,9 @@ interface TaskCardProps {
 }
 
 function TaskCard({ task, onDragStart, onClick, onMoveStatus, isDragging, mobileMode, portraitMode = true, unreadCount = 0 }: TaskCardProps) {
+  const updateTask = useMissionControl((state) => state.updateTask);
+  const [retryingDispatch, setRetryingDispatch] = useState(false);
+  const [retryDispatchError, setRetryDispatchError] = useState<string | null>(null);
   const priorityStyles = {
     low: 'text-mc-text-secondary',
     normal: 'text-mc-accent',
@@ -415,6 +441,35 @@ function TaskCard({ task, onDragStart, onClick, onMoveStatus, isDragging, mobile
   const isSubtask = !!task.is_subtask;
   const isAssigned = task.status === 'assigned';
   const dispatchError = task.planning_dispatch_error;
+  const environmentIssue = getTaskEnvironmentIssue(task);
+
+  const handleRetryDispatch = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setRetryingDispatch(true);
+    setRetryDispatchError(null);
+
+    try {
+      const res = await fetch(`/api/tasks/${task.id}/dispatch/retry`, { method: 'POST' });
+      const data = await res.json().catch(() => ({} as DispatchRetryResponse));
+
+      if (!res.ok || !data.success) {
+        const message = data.userMessage || data.error || 'Dispatch retry failed';
+        setRetryDispatchError(message);
+        console.error('Retry dispatch failed:', data.error || message);
+        return;
+      }
+
+      if (data.task) {
+        updateTask(data.task);
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Dispatch retry failed';
+      setRetryDispatchError(message);
+      console.error('Retry dispatch error:', err);
+    } finally {
+      setRetryingDispatch(false);
+    }
+  };
 
   return (
     <div
@@ -462,15 +517,49 @@ function TaskCard({ task, onDragStart, onClick, onMoveStatus, isDragging, mobile
           </div>
         )}
 
-        {isAssigned && dispatchError && (
-          <div className={`flex items-start gap-2 ${portraitMode ? 'mb-3 py-2 px-3' : 'mb-2 py-1.5 px-2.5'} bg-red-500/10 rounded-md border border-red-500/30`}>
-            <div className="w-2 h-2 bg-red-400 rounded-full mt-1 flex-shrink-0" />
-            <span className="text-xs text-red-300">Assigned, but blocked: {dispatchError}</span>
+        {environmentIssue && (
+          <EnvironmentIssuePanel
+            task={task}
+            compact
+            className={portraitMode ? 'mb-3' : 'mb-2'}
+          />
+        )}
+
+        {isAssigned && dispatchError && !environmentIssue && (
+          <div className={`${portraitMode ? 'mb-3 p-3' : 'mb-2 p-2.5'} bg-red-500/10 rounded-md border border-red-500/30`}>
+            <div className="flex items-start gap-2">
+              <AlertTriangle className="w-3.5 h-3.5 text-red-300 mt-0.5 flex-shrink-0" />
+              <div className="min-w-0 flex-1">
+                <div className="text-xs font-medium text-red-200">Dispatch blocked</div>
+                <div className="text-[11px] text-red-300/90 line-clamp-2" title={dispatchError}>
+                  {getDispatchErrorSummary(dispatchError)}
+                </div>
+              </div>
+            </div>
+            <button
+              onClick={handleRetryDispatch}
+              disabled={retryingDispatch}
+              className="mt-2 inline-flex items-center gap-1.5 text-[11px] px-2 py-1 bg-red-500/20 hover:bg-red-500/30 text-red-200 rounded border border-red-500/30 disabled:opacity-50"
+            >
+              <RefreshCw className={`w-3 h-3 ${retryingDispatch ? 'animate-spin' : ''}`} />
+              {retryingDispatch ? 'Retrying...' : 'Retry dispatch'}
+            </button>
+            {retryDispatchError && (
+              <div className="mt-1.5 text-[11px] text-red-300 line-clamp-2" title={retryDispatchError}>
+                {retryDispatchError}
+              </div>
+            )}
           </div>
         )}
 
-        {isAssigned && !dispatchError && (
-          <AssignedStatusBadge task={task} portraitMode={portraitMode} />
+        {isAssigned && !dispatchError && !environmentIssue && (
+          <AssignedStatusBadge
+            task={task}
+            portraitMode={portraitMode}
+            retrying={retryingDispatch}
+            retryError={retryDispatchError}
+            onRetryDispatch={handleRetryDispatch}
+          />
         )}
 
         {task.status === 'inbox' && !task.assigned_agent_id && (
@@ -480,7 +569,7 @@ function TaskCard({ task, onDragStart, onClick, onMoveStatus, isDragging, mobile
           </div>
         )}
 
-        {['testing', 'verification'].includes(task.status) && dispatchError && (
+        {['testing', 'verification'].includes(task.status) && dispatchError && !environmentIssue && (
           <div className={`flex items-start gap-2 ${portraitMode ? 'mb-3 py-2 px-3' : 'mb-2 py-1.5 px-2.5'} bg-red-500/10 rounded-md border border-red-500/30`}>
             <div className="w-2 h-2 bg-red-400 rounded-full mt-1 flex-shrink-0" />
             <span className="text-xs text-red-300">{dispatchError}</span>

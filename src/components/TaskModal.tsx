@@ -16,6 +16,7 @@ import { AgentLiveTab } from './AgentLiveTab';
 import { TaskChatTab } from './TaskChatTab';
 import { TaskFlightRecorder } from './TaskFlightRecorder';
 import { WorkspaceTab } from './WorkspaceTab';
+import { EnvironmentIssuePanel } from './EnvironmentIssuePanel';
 import type { Task, TaskPriority, TaskStatus } from '@/lib/types';
 
 type TabType = 'overview' | 'planning' | 'convoy' | 'team' | 'activity' | 'flight-recorder' | 'deliverables' | 'images' | 'sessions' | 'workspace' | 'agent-live' | 'chat';
@@ -250,6 +251,8 @@ export function TaskModal({ task, onClose, workspaceId }: TaskModalProps) {
           {/* Overview Tab */}
           {activeTab === 'overview' && (
             <form onSubmit={handleSubmit} className="space-y-4">
+          {task && <EnvironmentIssuePanel task={task} />}
+
           {/* Title */}
           <div>
             <label className="block text-sm font-medium mb-1">Title</label>
